@@ -71,21 +71,31 @@ enum BlinkState
 BlinkState blink_state = LED_WAIT;
 BlinkState blink_prevState = LED_OFF;
 
-#include <Beeper.h>
 #define BUZZER_PIN 13
-uint16_t beeper_freq_temp = 1000; // частота пищалки за замовчуванням
-Beeper beeper(BUZZER_PIN);
-enum BeepState
-{
+#define PWM_CHANNEL 0
+#define PWM_RESOLUTION 8
+
+enum BeepState {
   BEEP_STOP,
-  BEEP_CONTINUOUS,
-  BEEP_ONCE,
+  BEEP_ACTIVE,
+  BEEP_PAUSE,
   BEEP_ENTER,
   BEEP_DENIED,
-  BEEP_WIFI_START
+  BEEP_ONCE,
+  BEEP_WIFI_START,
+  BEEP_CONTINUOUS
 };
-BeepState beep_state = BEEP_ONCE;
+BeepState beep_state = BEEP_STOP;
 BeepState beep_prevState = BEEP_STOP;
+
+uint16_t beep_freq = 0;
+uint16_t beeper_freq_temp = 1000;
+uint8_t  beep_count = 0;
+uint8_t  beep_current = 0;
+uint16_t beep_onTime = 0;
+uint16_t beep_offTime = 0;
+unsigned long beep_timer = 0;
+bool beep_isOn = false;
 
 // ---- Налаштування / константи ----
 #define PREAMBLE 0xA5
@@ -222,42 +232,89 @@ void blink_tick(uint8_t relay_tim, uint8_t mosfet_tim)
   }
 }
 
-void beep_tick(uint16_t freq)
-{
-  beeper.tick(); // тикер библиотеки
+void beep_start(uint16_t freq, uint8_t count, uint16_t onTime, uint16_t offTime) {
+  beep_freq = freq;
+  beep_count = count;
+  beep_current = 0;
+  beep_onTime = onTime;
+  beep_offTime = offTime;
+  beep_isOn = false;
+  beep_timer = 0;
+  beep_state = BEEP_ACTIVE;
+}
 
-  if (beep_state != beep_prevState) // проверяем смену состояния
-  {
-    beep_prevState = beep_state;
-    // beeper.stop(); // глушим старое пищание
-    switch (beep_state)
-    {
+// === Основна логіка звуку ===
+void beep_tick() {
+  unsigned long now = millis();
+
+  switch (beep_state) {
     case BEEP_STOP:
-      beeper.stop();
       break;
 
-    case BEEP_ENTER:
-      beeper.beep(1000, 2, 300, 500); // 2 коротких писка
+    case BEEP_ACTIVE:
+      if (!beep_isOn) {
+        ledcWriteTone(PWM_CHANNEL, beep_freq);
+        beep_isOn = true;
+        beep_timer = now;
+      } else if (now - beep_timer >= beep_onTime) {
+        ledcWrite(PWM_CHANNEL, 0); // вимикаємо звук
+        beep_isOn = false;
+        beep_timer = now;
+        beep_current++;
+        if (beep_current >= beep_count) {
+          beep_state = BEEP_STOP;
+        } else {
+          beep_state = BEEP_PAUSE;
+        }
+      }
       break;
 
-    case BEEP_DENIED:
-      beeper.beep(200, 1, 600); // 2 длинных писка
+    case BEEP_PAUSE:
+      if (now - beep_timer >= beep_offTime) {
+        beep_state = BEEP_ACTIVE;
+      }
       break;
+  }
+}
 
-    case BEEP_ONCE:
-    ledcWriteTone(pwmChannel, 2000);
-      // beeper.beepForever(freq, 1, 600, 1200); // один короткий писк
-      beeper.beep(freq, 5, 2000, 500); // один короткий писк
-      Serial.print("Beep freq: ");
-      Serial.println(freq);
-      beep_state = BEEP_CONTINUOUS; // сбрасываем состояние после обработки
-      break;
+// === Керування високорівневими станами ===
+void beep_logic(uint16_t freq) {
+  if (beep_state != beep_prevState) {
+    beep_prevState = beep_state;
 
-    case BEEP_WIFI_START:
-      beeper.beep(950, 3, 300, 800); // 3 коротких писка
-      break;
+    switch (beep_state) {
+      case BEEP_STOP:
+        ledcWrite(PWM_CHANNEL, 0);
+        break;
+
+      case BEEP_ENTER:
+        beep_start(1000, 2, 300, 500); // 2 коротких
+        Serial.println("BEEP_ENTER");
+        break;
+
+      case BEEP_DENIED:
+        beep_start(200, 2, 600, 400); // 2 довгих
+        Serial.println("BEEP_DENIED");
+        break;
+
+      case BEEP_ONCE:
+        beep_start(freq, 1, 200, 0);
+        Serial.print("BEEP_ONCE: "); Serial.println(freq);
+        break;
+
+      case BEEP_WIFI_START:
+        beep_start(950, 3, 300, 800); // 3 коротких
+        Serial.println("BEEP_WIFI_START");
+        break;
+
+      case BEEP_CONTINUOUS:
+        ledcWriteTone(PWM_CHANNEL, freq);
+        Serial.println("BEEP_CONTINUOUS");
+        break;
     }
   }
+
+  beep_tick(); // оновлення FSM звуку
 }
 
 size_t utf8_truncate_by_chars(const char *src, char *dst, size_t max_chars, size_t dst_buf_size)
@@ -465,6 +522,9 @@ void setup()
   Serial.begin(115200);
   SPI.begin();
 
+  ledcSetup(PWM_CHANNEL, 2000, PWM_RESOLUTION);
+  ledcAttachPin(BUZZER_PIN, PWM_CHANNEL);
+
   rfid.PCD_Init();
   rfid.PCD_SetAntennaGain(rfid.RxGain_max); // Установка усиления антенны
   rfid.PCD_AntennaOff();                    // Перезагружаем антенну
@@ -477,10 +537,13 @@ void setup()
   delay(1000);
 
   LoRa.setPins(LORA_NSS_PIN, LORA_RST_PIN, LORA_DIO0_PIN); // setup LoRa transceiver module
+  int a = 5;                                               // кількість спроб ініціалізації LoRa
   while (!LoRa.begin(433E6))                               // 433E6 - Asia, 866E6 - Europe, 915E6 - North America
   {
     Serial.println(".");
     delay(500);
+    if (!--a)
+        break;
   }
 
   WiFi.mode(WIFI_AP_STA); // ======== WIFI ========
@@ -581,7 +644,16 @@ void loop()
 
   sett.tick();
   blink_tick(relay_time_temp, mosfet_time_temp);
-  beep_tick(beeper_freq_temp);
+  beep_logic(2000); // основна функція, яка керує станами
+
+  // Для демонстрації: міняємо тип кожні 4 секунди
+  static unsigned long t = 0;
+  if (millis() - t > 4000) {
+    t = millis();
+    static int i = 0;
+    i = (i + 1) % 5;
+    beep_state = (BeepState)(i + 1);
+  }
 
   //************************* РОБОТА З RFID **************************//
   if (!rfid.PICC_IsNewCardPresent())
