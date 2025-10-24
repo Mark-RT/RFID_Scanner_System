@@ -50,6 +50,7 @@ MFRC522::StatusCode status; // об'єкт статусу
 #define LORA_DIO0_PIN 4
 const unsigned long ACK_TIMEOUT = 800; // мілісекунд очікування підтвердження
 const uint8_t MAX_RETRIES = 3;
+uint16_t RETRIES_TIMEOUT = 500; // час до наступної спроби
 
 #include <Blinker.h>
 #define LED_R_PIN 25
@@ -64,6 +65,7 @@ Blinker relay(RELAY_PIN);
 Blinker mosfet(MOSFET_PIN);
 enum BlinkState
 {
+  BLINK_IDLE,
   LED_OFF,
   LED_WAIT,
   RELAY_ON
@@ -77,6 +79,7 @@ BlinkState blink_prevState = LED_OFF;
 
 enum BeepState
 {
+  BEEP_IDLE,
   BEEP_STOP,
   BEEP_ACTIVE,
   BEEP_PAUSE,
@@ -87,7 +90,7 @@ enum BeepState
   BEEP_CONTINUOUS
 };
 BeepState beep_state = BEEP_ONCE;
-BeepState beep_prevState = BEEP_STOP;
+BeepState beep_prevState = BEEP_CONTINUOUS;
 
 uint16_t beep_freq = 0;
 uint16_t beep_freq_temp = 0;
@@ -231,11 +234,16 @@ void blink_tick(uint8_t relay_tim, uint8_t mosfet_tim)
   relay.tick();
   mosfet.tick();
 
+  if (relay.ready())
+  {
+    blink_state = LED_WAIT;
+  }
+
   if (blink_state != blink_prevState) // проверяем смену состояния
   {
     blink_prevState = blink_state;
     led_B.stop();
-    
+
     switch (blink_state)
     {
     case LED_OFF:
@@ -253,26 +261,19 @@ void blink_tick(uint8_t relay_tim, uint8_t mosfet_tim)
       relay.blink(1, relay_tim * 1000, 0);   // включаем реле на relay_time секунд
       mosfet.blink(1, mosfet_tim * 1000, 0); // включаем MOSFET на mosfet_time секунд
       led_G.blink(1, relay_tim * 1000, 0);
-
       break;
     }
   }
 }
 
-// -----------------------------
-// Ініціалізація
-// -----------------------------
-void beep_init()
+void beep_init() // Ініціалізація
 {
   ledcSetup(PWM_CHANNEL, 2000, PWM_RESOLUTION);
   ledcAttachPin(BUZZER_PIN, PWM_CHANNEL);
   ledcWrite(PWM_CHANNEL, 0);
 }
 
-// -----------------------------
-// Запуск послідовності писків
-// -----------------------------
-void beep_start(uint16_t freq, uint8_t count, uint16_t onTime, uint16_t offTime)
+void beep_start(uint16_t freq, uint8_t count, uint16_t onTime, uint16_t offTime) // Запуск послідовності писків
 {
   beep_freq = freq;
   beep_count = count;
@@ -284,39 +285,21 @@ void beep_start(uint16_t freq, uint8_t count, uint16_t onTime, uint16_t offTime)
   beep_state = BEEP_ACTIVE;
 }
 
-// -----------------------------
-// Безперервний звук
-// -----------------------------
-void beep_continuous(uint16_t freq)
-{
-  ledcWriteTone(PWM_CHANNEL, freq);
-  beep_state = BEEP_CONTINUOUS;
-}
-
-// -----------------------------
-// Зупинка будь-якого сигналу
-// -----------------------------
-void beep_stop()
+void beep_stop() // Зупинка будь-якого писку
 {
   ledcWrite(PWM_CHANNEL, 0);
-  beep_state = BEEP_STOP;
   beep_isOn = false;
   beep_current = 0;
+  beep_state = BEEP_IDLE;
 }
 
-// -----------------------------
-// Основна неблокуюча логіка
-// -----------------------------
-void beep_tick()
+void beep_tick() // Функція обробки писку (асинхронна)
 {
   unsigned long now = millis();
 
   switch (beep_state)
   {
-  case BEEP_STOP:
-    break;
-
-  case BEEP_CONTINUOUS:
+  case BEEP_IDLE:
     // нічого не робимо
     break;
 
@@ -353,10 +336,7 @@ void beep_tick()
   }
 }
 
-// -----------------------------
-// Логіка шаблонів
-// -----------------------------
-void beep_logic(uint16_t freq)
+void beep_logic(uint16_t freq) // Основна логіка писку з обробкою станів
 {
   if (beep_state != beep_prevState)
   {
@@ -365,7 +345,8 @@ void beep_logic(uint16_t freq)
     switch (beep_state)
     {
     case BEEP_STOP:
-      ledcWrite(PWM_CHANNEL, 0);
+      beep_stop();
+      Serial.println("BEEP_STOP");
       break;
 
     case BEEP_ENTER:
@@ -385,12 +366,12 @@ void beep_logic(uint16_t freq)
       break;
 
     case BEEP_WIFI_START:
-      beep_start(950, 3, 300, 800);
+      beep_start(950, 3, 300, 600);
       Serial.println("BEEP_WIFI_START");
       break;
 
     case BEEP_CONTINUOUS:
-      beep_continuous(freq);
+      ledcWriteTone(PWM_CHANNEL, freq);
       Serial.println("BEEP_CONTINUOUS");
       break;
 
@@ -452,8 +433,7 @@ size_t utf8_truncate_by_chars(const char *src, char *dst, size_t max_chars, size
   return dst_i; // повертаємо байтову довжину (без '\0')
 }
 
-// ---- Ініціалізація з GyverDB ----
-void initFromDB()
+void initFromDB() // Ініціалізація змінних з БД
 {
   relay_time_temp = db.get(kk::relay_time);
   mosfet_time_temp = db.get(kk::mosfet_time);
@@ -473,16 +453,20 @@ void initFromDB()
   // deviceNameBuf тепер містить UTF-8 зріз (null-terminated)
 }
 
-// ---- CRC8 (твоя реалізація, зберегти сумісність) ----
+// ---- CRC8 ----
 uint8_t crc8(const uint8_t *data, size_t len)
 {
   uint8_t crc = 0x00;
   while (len--)
   {
-    crc ^= *data++;
-    for (uint8_t i = 0; i < 8; ++i)
+    uint8_t b = *data++;
+    for (uint8_t i = 0; i < 8; i++)
     {
-      crc = (crc & 0x80) ? (crc << 1) ^ 0x07 : (crc << 1);
+      uint8_t mix = (crc ^ b) & 0x01;
+      crc >>= 1;
+      if (mix)
+        crc ^= 0x8C;
+      b >>= 1;
     }
   }
   return crc;
@@ -511,6 +495,20 @@ uint8_t buildAndSend(uint8_t to, uint16_t msgId, uint8_t type, const uint8_t *pa
   uint8_t crc = crc8(buf, idx);
   buf[idx++] = crc;
 
+  // --- DEBUG: вивід сформованого пакета по байтах для відладки ---
+  Serial.println("Packet dump (index : 0xHEX):");
+  for (size_t _i = 0; _i < idx; ++_i)
+  {
+    Serial.print(_i);
+    Serial.print(" : 0x");
+    if (buf[_i] < 0x10)
+      Serial.print('0');
+    Serial.print(buf[_i], HEX);
+    Serial.println();
+  }
+  Serial.println("--- end packet ---");
+  // --- end debug ---
+
   LoRa.beginPacket();
   LoRa.write(buf, idx);
   LoRa.endPacket();
@@ -518,7 +516,9 @@ uint8_t buildAndSend(uint8_t to, uint16_t msgId, uint8_t type, const uint8_t *pa
 }
 
 // ---- waitForResponse: читати packetSize, мінімум 8 байт ----
-bool waitForResponse(uint16_t expectedMsgId, unsigned long timeout, uint8_t *outType, uint8_t *outPayload, uint8_t *outLen)
+// Оновлений waitForResponse: додаємо max size для outPayload
+bool waitForResponse(uint16_t expectedMsgId, unsigned long timeout,
+                     uint8_t *outType, uint8_t *outPayload, uint8_t *outLen, size_t outPayloadMaxLen)
 {
   unsigned long t0 = millis();
   while (millis() - t0 < timeout)
@@ -528,13 +528,11 @@ bool waitForResponse(uint16_t expectedMsgId, unsigned long timeout, uint8_t *out
     {
       uint8_t buf[256];
       int i = 0;
-      // читаємо саме packetSize байт (безпечніше)
       while (i < packetSize && LoRa.available() && i < (int)sizeof(buf))
         buf[i++] = LoRa.read();
 
       if (i < 8)
         continue; // мінімум 8 байт (preamble..crc)
-
       if (buf[0] != PREAMBLE)
         continue;
 
@@ -554,35 +552,39 @@ bool waitForResponse(uint16_t expectedMsgId, unsigned long timeout, uint8_t *out
       if (msgId != expectedMsgId)
         continue;
 
+      // Захист від некоректного len в пакеті
+      if ((int)len > i - 8)
+        continue;
+
       if (outType)
         *outType = type;
       if (outLen)
         *outLen = len;
       if (outPayload && len)
+      {
+        if ((size_t)len > outPayloadMaxLen)
+          continue; // пакет невідповідний або обрізаний — ігноруємо
         memcpy(outPayload, &buf[7], len);
+      }
       return true;
     }
   }
   return false;
 }
 
-// 3) Функція: зібрати payload і надіслати (включає name і uid)
-//    формат payload: [name_byte_len(1)][name_bytes][uid_len(1)][uid_bytes]
-bool sendUidWithName(uint8_t hubId, const uint8_t *uidBytes, uint8_t uidLen)
+// Оновлений sendUidWithName: НЕ інкрементує msgCounter; приймає msgId як параметр
+bool sendUidWithName(uint8_t hubId, uint16_t msgId, const uint8_t *uidBytes, uint8_t uidLen)
 {
   if (!uidBytes || uidLen == 0 || uidLen > MAX_UID_LEN)
     return false;
 
-  size_t nameBytes = strlen(deviceNameBuf); // байти UTF-8
-  if (nameBytes == 0)
-  {
-    // можна відправити ім'я довжиною 0 (але краще реєструвати ім'я окремо)
-  }
+  // Безпечний підрахунок байтів імені (обмеження MAX_NAME_BYTES)
+  size_t nameBytes = strnlen(deviceNameBuf, MAX_NAME_BYTES);
   if (nameBytes > MAX_NAME_BYTES)
     nameBytes = MAX_NAME_BYTES;
 
-  size_t payloadLen = 1 + nameBytes + 1 + uidLen;
-  if (payloadLen > MAX_TOTAL_PAYLOAD)
+  size_t payloadLen = 1 + nameBytes + 1 + uidLen; // додаткові службові байти
+  if (payloadLen > MAX_TOTAL_PAYLOAD || payloadLen > sizeof(uint8_t) * 256 - 8) // перевірка чи не перевищили ліміт
     return false;
 
   uint8_t payload[256];
@@ -597,9 +599,11 @@ bool sendUidWithName(uint8_t hubId, const uint8_t *uidBytes, uint8_t uidLen)
   memcpy(&payload[idx], uidBytes, uidLen);
   idx += uidLen;
 
-  uint16_t msgId = ++msgCounter;
-  // використовуємо існуючу buildAndSend (яка бере src = DEVICE_ID)
-  return (buildAndSend(hubId, msgId, TYPE_REQ, payload, (uint8_t)payloadLen) == 0);
+  // buildAndSend повертає 0 при успіху
+  bool ok = (buildAndSend(hubId, msgId, TYPE_REQ, payload, (uint8_t)payloadLen) == 0);
+  // Переводимо радіомодуль у режим прийому, якщо потрібно
+  LoRa.receive();
+  return ok;
 }
 
 void setup()
@@ -622,13 +626,16 @@ void setup()
 
   LoRa.setPins(LORA_NSS_PIN, LORA_RST_PIN, LORA_DIO0_PIN); // setup LoRa transceiver module
   int a = 5;                                               // кількість спроб ініціалізації LoRa
+  Serial.println("LoRa init");
   while (!LoRa.begin(433E6))                               // 433E6 - Asia, 866E6 - Europe, 915E6 - North America
   {
-    Serial.println(".");
+    Serial.print(".");
     delay(500);
     if (!--a)
       break;
   }
+  a > 0 ? Serial.println("LoRa init success") : Serial.println("LoRa init failed");
+  Serial.println();
 
   WiFi.mode(WIFI_AP_STA); // ======== WIFI ========
 
@@ -671,7 +678,7 @@ void setup()
     int tries = 15;
     while (WiFi.status() != WL_CONNECTED)
     {
-      delay(300);
+      delay(500);
       Serial.print('.');
       if (!--tries)
         break;
@@ -694,7 +701,7 @@ void setup()
         apCreated = true;
         break;
       }
-      delay(300);
+      delay(500);
       Serial.print('.');
     }
 
@@ -732,11 +739,11 @@ void loop()
 
   //************************* РОБОТА З RFID **************************//
   if (!rfid.PICC_IsNewCardPresent())
-    return; // Если новая метка не поднесена - вернуться в начало loop
+    return;
   if (!rfid.PICC_ReadCardSerial())
-    return; // Если метка не читается - вернуться в начало loop
+    return;
 
-  // логування
+  // Логування UID
   Serial.print("UID: ");
   for (uint8_t i = 0; i < rfid.uid.size; i++)
   {
@@ -747,39 +754,33 @@ void loop()
   }
   Serial.println();
 
-  // відправляємо packet з назвою + uid
-  msgCounter++;
+  // Підготовка msgId (інкремент один раз ДО спроб)
+  uint16_t msgId = ++msgCounter;
+
   uint8_t tries = 0;
   bool success = false;
+  uint32_t retries_timeout_temp = 0;
   while (tries < MAX_RETRIES && !success)
   {
-    // Збираємо payload і відправляємо
-    // Спочатку формуємо payload і викликаємо buildAndSend безпосередньо, щоб отримати msgId
-    size_t nameBytes = strlen(deviceNameBuf);
-    if (nameBytes > MAX_NAME_BYTES)
-      nameBytes = MAX_NAME_BYTES;
-    size_t payloadLen = 1 + nameBytes + 1 + rfid.uid.size;
-    if (payloadLen <= MAX_TOTAL_PAYLOAD)
+    if (millis() - retries_timeout_temp >= RETRIES_TIMEOUT)
     {
-      uint8_t payload[256];
-      size_t idx = 0;
-      payload[idx++] = (uint8_t)nameBytes;
-      memcpy(&payload[idx], deviceNameBuf, nameBytes);
-      idx += nameBytes;
-      payload[idx++] = rfid.uid.size;
-      memcpy(&payload[idx], rfid.uid.uidByte, rfid.uid.size);
-      idx += rfid.uid.size;
+      // Викликаємо утиліту, яка сформує payload і відправить (не інкрементує msgCounter)
+      if (!sendUidWithName(HUB_ID, msgId, rfid.uid.uidByte, rfid.uid.size))
+      {
+        Serial.println("Failed to build/send payload");
+        break; // немає сенсу повторювати, payload некоректний
+      }
 
-      buildAndSend(HUB_ID, msgCounter, TYPE_REQ, payload, (uint8_t)payloadLen);
-      LoRa.receive();
-
-      uint8_t respType, respPayload[32], respLen;
-      if (waitForResponse(msgCounter, ACK_TIMEOUT, &respType, respPayload, &respLen))
+      // Очікуємо відповідь
+      uint8_t respType;
+      uint8_t respPayload[32];
+      uint8_t respLen;
+      if (waitForResponse(msgId, ACK_TIMEOUT, &respType, respPayload, &respLen, sizeof(respPayload)))
       {
         if (respType == CMD_OPEN)
         {
-          Serial.println("OPEN command received");
-          // виконати відкриття замка
+          Serial.println("OPEN отримано");
+          blink_state = RELAY_ON;
         }
         else if (respType == CMD_DENY)
         {
@@ -791,16 +792,14 @@ void loop()
       else
       {
         tries++;
-        unsigned long back = random(50, 150) * tries;
-        delay(back);
+        retries_timeout_temp = millis();
+        Serial.print("No response, retry ");
+        Serial.println(tries);
       }
     }
-    else
-    {
-      Serial.println("Payload too large to send");
-      break;
-    }
+    delay(2);
   }
+
   if (!success)
   {
     Serial.println("No response from hub");
