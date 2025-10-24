@@ -614,7 +614,7 @@ void setup()
   beep_init();
 
   rfid.PCD_Init();
-  rfid.PCD_SetAntennaGain(rfid.RxGain_max); // Установка усиления антенны
+  rfid.PCD_SetAntennaGain(rfid.RxGain_avg); // Установка усиления антенны
   rfid.PCD_AntennaOff();                    // Перезагружаем антенну
   rfid.PCD_AntennaOn();                     // Включаем антенну
   for (byte i = 0; i < 6; i++)
