@@ -49,8 +49,8 @@ MFRC522::StatusCode status; // об'єкт статусу
 #define LORA_RST_PIN 16
 #define LORA_DIO0_PIN 4
 const unsigned long ACK_TIMEOUT = 800; // мілісекунд очікування підтвердження
-const uint8_t MAX_RETRIES = 3;
-uint16_t RETRIES_TIMEOUT = 500; // час до наступної спроби
+const uint8_t MAX_RETRIES = 10;
+uint16_t RETRIES_TIMEOUT = 300; // час до наступної спроби
 
 #include <Blinker.h>
 #define LED_R_PIN 25
@@ -350,12 +350,12 @@ void beep_logic(uint16_t freq) // Основна логіка писку з об
       break;
 
     case BEEP_ENTER:
-      beep_start(1000, 2, 300, 500);
+      beep_start(1000, 2, 250, 150);
       Serial.println("BEEP_ENTER");
       break;
 
     case BEEP_DENIED:
-      beep_start(200, 2, 300, 400);
+      beep_start(200, 1, 300, 0);
       Serial.println("BEEP_DENIED");
       break;
 
@@ -583,7 +583,7 @@ bool sendUidWithName(uint8_t hubId, uint16_t msgId, const uint8_t *uidBytes, uin
   if (nameBytes > MAX_NAME_BYTES)
     nameBytes = MAX_NAME_BYTES;
 
-  size_t payloadLen = 1 + nameBytes + 1 + uidLen; // додаткові службові байти
+  size_t payloadLen = 1 + nameBytes + 1 + uidLen;                               // додаткові службові байти
   if (payloadLen > MAX_TOTAL_PAYLOAD || payloadLen > sizeof(uint8_t) * 256 - 8) // перевірка чи не перевищили ліміт
     return false;
 
@@ -601,7 +601,7 @@ bool sendUidWithName(uint8_t hubId, uint16_t msgId, const uint8_t *uidBytes, uin
 
   // buildAndSend повертає 0 при успіху
   bool ok = (buildAndSend(hubId, msgId, TYPE_REQ, payload, (uint8_t)payloadLen) == 0);
-  // Переводимо радіомодуль у режим прийому, якщо потрібно
+  // Переводимо радіомодуль у режим прийому
   LoRa.receive();
   return ok;
 }
@@ -621,12 +621,10 @@ void setup()
   {                        // Наполняем ключ
     key.keyByte[i] = 0xFF; // Ключ по умолчанию 0xFFFFFFFFFFFF
   }
-  Serial.println("RFID OK!");
-  delay(1000);
 
+  Serial.print("LoRa init ");
   LoRa.setPins(LORA_NSS_PIN, LORA_RST_PIN, LORA_DIO0_PIN); // setup LoRa transceiver module
   int a = 5;                                               // кількість спроб ініціалізації LoRa
-  Serial.println("LoRa init");
   while (!LoRa.begin(433E6))                               // 433E6 - Asia, 866E6 - Europe, 915E6 - North America
   {
     Serial.print(".");
@@ -634,8 +632,7 @@ void setup()
     if (!--a)
       break;
   }
-  a > 0 ? Serial.println("LoRa init success") : Serial.println("LoRa init failed");
-  Serial.println();
+  a > 0 ? Serial.println("success") : Serial.println("failed");
 
   WiFi.mode(WIFI_AP_STA); // ======== WIFI ========
 
@@ -674,7 +671,7 @@ void setup()
   if (db[kk::wifi_ssid].length())
   {
     WiFi.begin(db[kk::wifi_ssid], db[kk::wifi_pass]);
-    Serial.print("Connect STA");
+    Serial.print("Connect STA ");
     int tries = 15;
     while (WiFi.status() != WL_CONNECTED)
     {
@@ -683,8 +680,6 @@ void setup()
       if (!--tries)
         break;
     }
-    Serial.println();
-    Serial.print("IP STA: ");
     Serial.println(WiFi.localIP());
   }
 
@@ -695,7 +690,7 @@ void setup()
 
     while (triess--)
     {
-      Serial.print("Create AP");
+      Serial.print("Створюю AP ");
       if (WiFi.softAP(db[kk::wifi_ap_ssid], db[kk::wifi_ap_pass]))
       {
         apCreated = true;
@@ -707,7 +702,7 @@ void setup()
 
     if (apCreated)
     {
-      Serial.print("AP створено успішно: ");
+      Serial.print("успішно: ");
       Serial.println(WiFi.softAPIP());
     }
     else
@@ -743,16 +738,16 @@ void loop()
   if (!rfid.PICC_ReadCardSerial())
     return;
 
-  // Логування UID
-  Serial.print("UID: ");
+  String uidStr = "";
   for (uint8_t i = 0; i < rfid.uid.size; i++)
   {
     if (rfid.uid.uidByte[i] < 0x10)
-      Serial.print('0');
-    Serial.print(rfid.uid.uidByte[i], HEX);
-    Serial.print(' ');
+      uidStr += "0";
+    uidStr += String(rfid.uid.uidByte[i], HEX);
   }
-  Serial.println();
+  uidStr.toUpperCase(); // при желании сделать все символы заглавными
+  logger.println(sets::Logger::warn() + "UID: " + uidStr);
+  Serial.println("UID: " + uidStr);
 
   // Підготовка msgId (інкремент один раз ДО спроб)
   uint16_t msgId = ++msgCounter;
@@ -781,10 +776,12 @@ void loop()
         {
           Serial.println("OPEN отримано");
           blink_state = RELAY_ON;
+          beep_state = BEEP_ENTER;
         }
         else if (respType == CMD_DENY)
         {
           Serial.println("DENY command received");
+          beep_state = BEEP_DENIED;
         }
         success = true;
         break;
@@ -802,7 +799,8 @@ void loop()
 
   if (!success)
   {
-    Serial.println("No response from hub");
+    logger.println(sets::Logger::error() + "Нема відповіді від хаба");
+    Serial.println("Нема відповіді від хаба");
   }
 
   // Завершаємо роботу з міткою

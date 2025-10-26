@@ -1,3 +1,4 @@
+#include <Arduino.h>
 #include <SPI.h>
 
 #include <GyverDBFile.h>
@@ -36,6 +37,12 @@ MFRC522::StatusCode status; // об'єкт статусу
 const unsigned long ACK_TIMEOUT = 800; // мілісекунд очікування підтвердження
 const uint8_t MAX_RETRIES = 3;
 uint16_t RETRIES_TIMEOUT = 500; // час до наступної спроби
+
+#include <EncButton.h>
+EncButton eb(36, 39, 34);
+
+#include <GyverOLED.h>
+GyverOLED<SSD1306_128x64, OLED_NO_BUFFER> oled;
 
 #include <Blinker.h>
 #define LED_R_PIN 25
@@ -539,6 +546,14 @@ void setup()
   SPI.begin();
 
   beep_init();
+  oled.init();  // инициализация
+  oled.clear(); // очистить дисплей (или буфер)
+
+  oled.home(); // курсор в 0,0
+  //oled.setScale(2);
+  oled.print("Hello!"); // печатай что угодно: числа, строки, float, как Serial!
+  oled.update();
+  delay(2000);
 
   rfid.PCD_Init();
   rfid.PCD_SetAntennaGain(rfid.RxGain_max); // Установка усиления антенны
@@ -548,21 +563,18 @@ void setup()
   {                        // Наполняем ключ
     key.keyByte[i] = 0xFF; // Ключ по умолчанию 0xFFFFFFFFFFFF
   }
-  Serial.println("RFID OK!");
-  delay(1000);
 
+  Serial.print("LoRa init ");
   LoRa.setPins(LORA_NSS_PIN, LORA_RST_PIN, LORA_DIO0_PIN); // setup LoRa transceiver module
   int a = 5;                                               // кількість спроб ініціалізації LoRa
-  Serial.print("LoRa init");
-  while (!LoRa.begin(433E6)) // 433E6 - Asia, 866E6 - Europe, 915E6 - North America
+  while (!LoRa.begin(433E6))                               // 433E6 - Asia, 866E6 - Europe, 915E6 - North America
   {
     Serial.print(".");
     delay(500);
     if (!--a)
       break;
   }
-  a > 0 ? Serial.println("LoRa init success") : Serial.println("LoRa init failed");
-  Serial.println();
+  a > 0 ? Serial.println("success") : Serial.println("failed");
 
   WiFi.mode(WIFI_AP_STA); // ======== WIFI ========
 
@@ -593,7 +605,7 @@ void setup()
   if (db[kk::wifi_ssid].length())
   {
     WiFi.begin(db[kk::wifi_ssid], db[kk::wifi_pass]);
-    Serial.print("Connect STA");
+    Serial.print("Connect STA ");
     int tries = 15;
     while (WiFi.status() != WL_CONNECTED)
     {
@@ -602,8 +614,6 @@ void setup()
       if (!--tries)
         break;
     }
-    Serial.println();
-    Serial.print("IP STA: ");
     Serial.println(WiFi.localIP());
   }
 
@@ -614,7 +624,7 @@ void setup()
 
     while (triess--)
     {
-      Serial.print("Create AP");
+      Serial.print("Створюю AP ");
       if (WiFi.softAP(db[kk::wifi_ap_ssid], db[kk::wifi_ap_pass]))
       {
         apCreated = true;
@@ -626,7 +636,7 @@ void setup()
 
     if (apCreated)
     {
-      Serial.print("AP створено успішно: ");
+      Serial.print("успішно: ");
       Serial.println(WiFi.softAPIP());
     }
     else
@@ -642,7 +652,7 @@ void setup()
 
 void loop()
 {
-  /*static uint32_t rebootTimer = millis(); // Важный костыль против зависания модуля!
+  static uint32_t rebootTimer = millis(); // Важный костыль против зависания модуля!
   if (millis() - rebootTimer >= 2000)
   {                                    // Таймер с периодом 2000 мс
     rebootTimer = millis();            // Обновляем таймер
@@ -650,13 +660,39 @@ void loop()
     delayMicroseconds(2);              // Ждем 2 мкс
     digitalWrite(RC522_RST_PIN, LOW);  // Отпускаем сброс
     rfid.PCD_Init();                   // Инициализируем заного
-  }*/
+  }
 
   sett.tick();
   blink_tick();
   beep_logic(beep_freq_temp); // основна функція, яка керує станами
   handleIncomingPacket();
 
+  eb.tick();
+  // обработка поворота раздельная
+  if (eb.left())
+  {
+    Serial.println("left");
+  }
+
+  if (eb.right())
+  {
+    Serial.println("right");
+  }
+
+  if (eb.leftH())
+  {
+    Serial.println("leftH");
+  }
+
+  if (eb.rightH())
+  {
+    Serial.println("rightH");
+  }
+
+  if (eb.click())
+  {
+    Serial.println("click");
+  }
   //************************* РОБОТА З RFID **************************//
   /*if (!rfid.PICC_IsNewCardPresent())
     return;
