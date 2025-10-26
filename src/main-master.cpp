@@ -6,13 +6,13 @@
 GyverDBFile db(&LittleFS, "/data.db");
 
 #include <SettingsGyver.h>
-SettingsGyver sett("RFID сканер", &db);
+SettingsGyver sett("HUB RFID", &db);
 
 enum kk : size_t // ключі для зберігання в базі даних
 {
   hub_id,
 
-  beeper_freq,
+  beeper_web_freq,
 
   wifi_ap_ssid,
   wifi_ap_pass,
@@ -37,6 +37,10 @@ MFRC522::StatusCode status; // об'єкт статусу
 const unsigned long ACK_TIMEOUT = 800; // мілісекунд очікування підтвердження
 const uint8_t MAX_RETRIES = 3;
 uint16_t RETRIES_TIMEOUT = 500; // час до наступної спроби
+
+#include <SD.h>
+#include <FS.h>
+#define SD_CS 14
 
 #include <EncButton.h>
 EncButton eb(36, 39, 34);
@@ -126,24 +130,9 @@ void build(sets::Builder &b)
     b.Pass(kk::wifi_ap_pass, "Пароль:");
   }
 
-  if (b.beginGroup("Для розробника"))
   {
-    if (b.beginMenu("Тест"))
-    {
-      b.Slider(kk::beeper_freq, "Частота:", 100, 5000, 50, "Гц");
-      if (b.beginRow())
-      {
-        if (b.Button("Синій"))
-        {
-          Serial.print("Синій: ");
-          Serial.println(b.build.pressed());
-          blink_state = LED_WAIT;
-        }
-        b.endRow();
-      }
-      b.endMenu(); // не забываем завершить меню
-    }
-    b.endGroup(); // НЕ ЗАБЫВАЕМ ЗАВЕРШИТЬ ГРУППУ
+    sets::Group g(b, "Для розробника, відладка");
+    b.Slider(kk::beeper_web_freq, "Частота зумера:", 100, 5000, 50, "Гц");
   }
 
   {
@@ -164,7 +153,7 @@ void build(sets::Builder &b)
 
   switch (b.build.id)
   {
-  case kk::beeper_freq:
+  case kk::beeper_web_freq:
     Serial.print("Введено частоту: ");
     Serial.println(b.build.value);
     logger.print("Введено частоту: ");
@@ -407,13 +396,12 @@ void handleIncomingPacket()
   int packetSize = LoRa.parsePacket();
   if (packetSize <= 0)
     return;
-  Serial.println("LoRa packet received");
   uint8_t buf[256];
   int i = 0;
   while (i < packetSize && LoRa.available() && i < (int)sizeof(buf))
     buf[i++] = LoRa.read();
 
-  Serial.print("Received packet of size ");
+  Serial.print("Прийнято пакет розміром: ");
   Serial.println(i);
   if (i < 8 || buf[0] != PREAMBLE)
     return;
@@ -422,46 +410,43 @@ void handleIncomingPacket()
   uint8_t recv_crc = buf[i - 1];
   if (crc8(buf, i - 1) != recv_crc)
   {
-    Serial.println("CRC mismatch, ignoring packet");
+    Serial.println("CRC не співпадає, ігнор");
     return;
   }
 
-  uint8_t from = buf[1];
-  uint8_t to = buf[2];
+  uint8_t device = buf[1];
+  uint8_t hub = buf[2];
   uint16_t msgId = (uint16_t(buf[3]) << 8) | uint16_t(buf[4]);
   uint8_t type = buf[5];
   uint8_t len = buf[6];
 
   // Перевіряємо, що пакет призначений хабу (DEVICE_ID) або broadcast (0)
-  if (to != HUB_ID && to != 0)
+  if (hub != HUB_ID && hub != 0)
     return;
 
   // Захист від некоректного len
   if ((int)len > i - 8)
     return;
 
-  // Обробка TYPE_REQ (запит від сканера)
-  if (type == TYPE_REQ)
+  if (type == TYPE_REQ) // обробка TYPE_REQ (запит від сканера)
   {
     // Розбираємо payload: [name_len][name_bytes][uid_len][uid_bytes]
     if (len < 2)
     {
-      Serial.println("REQ payload too short");
-      // Можна відправити DENY
-      buildAndSend(from, msgId, CMD_DENY, NULL, 0);
+      Serial.println("REQ payload короткий, відміна");
+      buildAndSend(device, msgId, CMD_DENY, NULL, 0); // відправляємо відміну
       return;
     }
 
     uint8_t name_len = buf[7];
-    if ((size_t)name_len > len - 2)
-    { // мінімум uid_len + 0 uid bytes
-      Serial.println("Bad name_len in payload");
-      buildAndSend(from, msgId, CMD_DENY, NULL, 0);
+    if ((size_t)name_len > len - 2) // мінімум uid_len + 0 uid bytes
+    {
+      Serial.println("Пошкоджене ім'я в payload, відміна");
+      buildAndSend(device, msgId, CMD_DENY, NULL, 0);
       return;
     }
 
-    // Зчитати імя (не обов'язково нуль-терміноване)
-    String deviceName = "";
+    String deviceName = ""; // зчитуємо ім'я
     if (name_len > 0)
     {
       char tmp[129];
@@ -471,19 +456,18 @@ void handleIncomingPacket()
       deviceName = String(tmp);
     }
 
-    // Де індекс uid_len?
     size_t uid_len_index = 8 + name_len;
     if (uid_len_index >= (size_t)i)
     { // вийшли за межі
       Serial.println("Payload truncated before uid_len");
-      buildAndSend(from, msgId, CMD_DENY, NULL, 0);
+      buildAndSend(device, msgId, CMD_DENY, NULL, 0);
       return;
     }
     uint8_t uid_len = buf[uid_len_index];
     if (uid_len == 0 || uid_len > MAX_UID_LEN)
     {
       Serial.println("Bad uid_len");
-      buildAndSend(from, msgId, CMD_DENY, NULL, 0);
+      buildAndSend(device, msgId, CMD_DENY, NULL, 0);
       return;
     }
 
@@ -491,7 +475,7 @@ void handleIncomingPacket()
     if ((int)uid_start + uid_len > i - 1)
     { // -1 через CRC в кінці
       Serial.println("UID bytes out of range");
-      buildAndSend(from, msgId, CMD_DENY, NULL, 0);
+      buildAndSend(device, msgId, CMD_DENY, NULL, 0);
       return;
     }
 
@@ -501,7 +485,7 @@ void handleIncomingPacket()
 
     // Логування
     Serial.print("REQ від: ");
-    Serial.print(from);
+    Serial.print(device);
     Serial.print("  msgId: ");
     Serial.print(msgId);
     Serial.print("  Назва: '");
@@ -517,7 +501,7 @@ void handleIncomingPacket()
     Serial.println();
 
     // --- Відправляємо текстову відповідь "Дозволено" ---
-    buildAndSend(from, msgId, CMD_OPEN, NULL, 0);
+    buildAndSend(device, msgId, CMD_OPEN, NULL, 0);
     Serial.println("-> CMD_OPEN дозволено");
     /*
         // Проста логіка доступу
@@ -540,133 +524,8 @@ void handleIncomingPacket()
   }
 }
 
-void setup()
+void encoderB_tick()
 {
-  Serial.begin(115200);
-  SPI.begin();
-
-  beep_init();
-  oled.init();  // инициализация
-  oled.clear(); // очистить дисплей (или буфер)
-
-  oled.home(); // курсор в 0,0
-  //oled.setScale(2);
-  oled.print("Hello!"); // печатай что угодно: числа, строки, float, как Serial!
-  oled.update();
-  delay(2000);
-
-  rfid.PCD_Init();
-  rfid.PCD_SetAntennaGain(rfid.RxGain_max); // Установка усиления антенны
-  rfid.PCD_AntennaOff();                    // Перезагружаем антенну
-  rfid.PCD_AntennaOn();                     // Включаем антенну
-  for (byte i = 0; i < 6; i++)
-  {                        // Наполняем ключ
-    key.keyByte[i] = 0xFF; // Ключ по умолчанию 0xFFFFFFFFFFFF
-  }
-
-  Serial.print("LoRa init ");
-  LoRa.setPins(LORA_NSS_PIN, LORA_RST_PIN, LORA_DIO0_PIN); // setup LoRa transceiver module
-  int a = 5;                                               // кількість спроб ініціалізації LoRa
-  while (!LoRa.begin(433E6))                               // 433E6 - Asia, 866E6 - Europe, 915E6 - North America
-  {
-    Serial.print(".");
-    delay(500);
-    if (!--a)
-      break;
-  }
-  a > 0 ? Serial.println("success") : Serial.println("failed");
-
-  WiFi.mode(WIFI_AP_STA); // ======== WIFI ========
-
-  // ======== SETTINGS ========
-  sett.begin();
-  sett.onBuild(build);
-  sett.onUpdate(update);
-  sett.config.theme = sets::Colors::Mint; // основной цвет
-
-  // ======== DATABASE ========
-#ifdef ESP32
-  LittleFS.begin(true);
-#else
-  LittleFS.begin();
-#endif
-
-  db.begin();
-  db.init(kk::hub_id, 1);
-  db.init(kk::beeper_freq, 1000);
-  db.init(kk::wifi_ap_ssid, "HUB_RFID");
-  db.init(kk::wifi_ap_pass, "12345678");
-  db.init(kk::wifi_ssid, "");
-  db.init(kk::wifi_pass, "");
-
-  // часовой пояс для rtc
-  setStampZone(2);
-
-  if (db[kk::wifi_ssid].length())
-  {
-    WiFi.begin(db[kk::wifi_ssid], db[kk::wifi_pass]);
-    Serial.print("Connect STA ");
-    int tries = 15;
-    while (WiFi.status() != WL_CONNECTED)
-    {
-      delay(500);
-      Serial.print('.');
-      if (!--tries)
-        break;
-    }
-    Serial.println(WiFi.localIP());
-  }
-
-  if (db[kk::wifi_ap_ssid].length())
-  {
-    int triess = 15;
-    bool apCreated = false;
-
-    while (triess--)
-    {
-      Serial.print("Створюю AP ");
-      if (WiFi.softAP(db[kk::wifi_ap_ssid], db[kk::wifi_ap_pass]))
-      {
-        apCreated = true;
-        break;
-      }
-      delay(500);
-      Serial.print('.');
-    }
-
-    if (apCreated)
-    {
-      Serial.print("успішно: ");
-      Serial.println(WiFi.softAPIP());
-    }
-    else
-    {
-      Serial.println("Не вдалося створити AP, створюємо запасний...");
-      WiFi.softAP("RFID_rezerv", "12345678");
-      Serial.print("AP: ");
-      Serial.println(WiFi.softAPIP());
-    }
-  }
-  initFromDB();
-}
-
-void loop()
-{
-  static uint32_t rebootTimer = millis(); // Важный костыль против зависания модуля!
-  if (millis() - rebootTimer >= 2000)
-  {                                    // Таймер с периодом 2000 мс
-    rebootTimer = millis();            // Обновляем таймер
-    digitalWrite(RC522_RST_PIN, HIGH); // Сбрасываем модуль
-    delayMicroseconds(2);              // Ждем 2 мкс
-    digitalWrite(RC522_RST_PIN, LOW);  // Отпускаем сброс
-    rfid.PCD_Init();                   // Инициализируем заного
-  }
-
-  sett.tick();
-  blink_tick();
-  beep_logic(beep_freq_temp); // основна функція, яка керує станами
-  handleIncomingPacket();
-
   eb.tick();
   // обработка поворота раздельная
   if (eb.left())
@@ -693,6 +552,267 @@ void loop()
   {
     Serial.println("click");
   }
+}
+
+// Write to the SD card
+void writeFile(fs::FS &fs, const char *path, const char *message)
+{
+  Serial.printf("Writing file: %s\n", path);
+
+  File file = fs.open(path, FILE_WRITE);
+  if (!file)
+  {
+    Serial.println("Failed to open file for writing");
+    return;
+  }
+  if (file.print(message))
+  {
+    Serial.println("File written");
+  }
+  else
+  {
+    Serial.println("Write failed");
+  }
+  file.close();
+}
+
+void listDir(fs::FS &fs, const char *dirname, uint8_t levels)
+{
+  Serial.printf("Listing directory: %s\n", dirname);
+
+  File root = fs.open(dirname);
+  if (!root)
+  {
+    Serial.println("Failed to open directory");
+    return;
+  }
+  if (!root.isDirectory())
+  {
+    Serial.println("Not a directory");
+    return;
+  }
+
+  File file = root.openNextFile();
+  while (file)
+  {
+    if (file.isDirectory())
+    {
+      Serial.print("  DIR : ");
+      Serial.println(file.name());
+      if (levels)
+      {
+        listDir(fs, file.name(), levels - 1);
+      }
+    }
+    else
+    {
+      Serial.print("  FILE: ");
+      Serial.print(file.name());
+      Serial.print("  SIZE: ");
+      Serial.println(file.size());
+    }
+    file = root.openNextFile();
+  }
+}
+
+void setup()
+{
+  Serial.begin(115200);
+  SPI.begin();
+
+  beep_init();
+
+  //=============== ДИСПЛЕЙ ===============
+  oled.init();  // инициализация
+  oled.clear(); // очистить дисплей (или буфер)
+
+  oled.home(); // курсор в 0,0
+  oled.setScale(1);
+
+  //============= RFID ===============
+  rfid.PCD_Init();
+  rfid.PCD_SetAntennaGain(rfid.RxGain_max); // Установка усиления антенны
+  rfid.PCD_AntennaOff();                    // Перезагружаем антенну
+  rfid.PCD_AntennaOn();                     // Включаем антенну
+  for (byte i = 0; i < 6; i++)
+  {                        // Наполняем ключ
+    key.keyByte[i] = 0xFF; // Ключ по умолчанию 0xFFFFFFFFFFFF
+  }
+  oled.println("RFID -> OK");
+  delay(200);
+
+  //============= LoRa ===============
+  Serial.print("LoRa init ");
+  LoRa.setPins(LORA_NSS_PIN, LORA_RST_PIN, LORA_DIO0_PIN); // setup LoRa transceiver module
+  int a = 5;                                               // кількість спроб ініціалізації LoRa
+  while (!LoRa.begin(433E6))                               // 433E6 - Asia, 866E6 - Europe, 915E6 - North America
+  {
+    Serial.print(".");
+    delay(500);
+    if (!--a)
+      break;
+  }
+  if (a > 0)
+  {
+    Serial.println("success");
+    oled.println("LoRa -> OK");
+  }
+  else
+  {
+    Serial.println("failed");
+    oled.println("LoRa -> not find");
+  }
+  delay(200);
+
+  //================= SD CARD ====================
+  Serial.print("Initializing SD card ");
+  a = 5;                   // кількість спроб ініціалізації LoRa
+  while (!SD.begin(SD_CS)) // 433E6 - Asia, 866E6 - Europe, 915E6 - North America
+  {
+    Serial.print(".");
+    delay(500);
+    if (!--a)
+      break;
+  }
+  if (a > 0)
+  {
+    Serial.println("success");
+    oled.println("SD -> OK");
+  }
+  else
+  {
+    Serial.println("failed");
+    oled.println("SD -> not find");
+  }
+
+  if (SD.cardType() == CARD_NONE)
+  {
+    Serial.println("SD карта відсутня");
+    oled.println("SD карта вiдсутня");
+  }
+
+  // If the data.txt file doesn't exist
+  // Create a file on the SD card and write the data labels
+  File file = SD.open("/database.txt");
+  if (!file)
+  {
+    Serial.println("File doesn't exist");
+    Serial.println("Creating file...");
+    oled.println("Нема файлу. Створення...");
+    writeFile(SD, "/database.txt", "Epoch Time, Temperature, Humidity, Pressure \r\n");
+  }
+  else
+  {
+    Serial.println("File already exists");
+    oled.println("Файл -> OK");
+  }
+  file.close();
+  listDir(SD, "/", 0);
+
+  delay(300);
+
+  // ======== WIFI ========
+  WiFi.mode(WIFI_AP_STA);
+
+  // ======== SETTINGS ========
+  sett.begin();
+  sett.onBuild(build);
+  sett.onUpdate(update);
+  sett.config.theme = sets::Colors::Mint; // основной цвет
+
+  // ======== DATABASE ========
+#ifdef ESP32
+  LittleFS.begin(true);
+#else
+  LittleFS.begin();
+#endif
+
+  db.begin();
+  db.init(kk::hub_id, 1);
+  db.init(kk::beeper_web_freq, 1000);
+  db.init(kk::wifi_ap_ssid, "HUB_RFID");
+  db.init(kk::wifi_ap_pass, "12345678");
+  db.init(kk::wifi_ssid, "");
+  db.init(kk::wifi_pass, "");
+
+  // ======== WIFI ========
+  setStampZone(2); // годинний пояс
+  if (db[kk::wifi_ssid].length())
+  {
+    WiFi.begin(db[kk::wifi_ssid], db[kk::wifi_pass]);
+    Serial.print("Connect to " + db[kk::wifi_ssid]);
+    int tries = 15;
+    while (WiFi.status() != WL_CONNECTED)
+    {
+      delay(500);
+      Serial.print('.');
+      if (!--tries)
+        break;
+    }
+    if (WiFi.status() == WL_CONNECTED)
+    {
+      oled.println("WiFi пiдключений");
+      Serial.println(WiFi.localIP());
+    }
+  }
+
+  if (db[kk::wifi_ap_ssid].length())
+  {
+    int tries = 15;
+    bool apCreated = false;
+
+    while (tries--)
+    {
+      Serial.print("Створюю AP ");
+      if (WiFi.softAP(db[kk::wifi_ap_ssid], db[kk::wifi_ap_pass]))
+      {
+        apCreated = true;
+        break;
+      }
+      delay(500);
+      Serial.print('.');
+    }
+
+    if (apCreated)
+    {
+      Serial.print("успішно: ");
+      Serial.println(WiFi.softAPIP());
+      oled.println("Точка доступу -> OK");
+      oled.println(WiFi.softAPIP());
+    }
+    else
+    {
+      Serial.println("Не вдалося створити AP, створюємо запасний...");
+      WiFi.softAP("RFID_rezerv", "12345678");
+      Serial.print("AP: ");
+      Serial.println(WiFi.softAPIP());
+      oled.println("Точка доступу -> *OK");
+      oled.println(WiFi.softAPIP());
+    }
+  }
+  delay(600);
+
+  initFromDB();
+}
+
+void loop()
+{
+  static uint32_t rebootTimer = millis(); // Важный костыль против зависания модуля!
+  if (millis() - rebootTimer >= 2000)
+  {                                    // Таймер с периодом 2000 мс
+    rebootTimer = millis();            // Обновляем таймер
+    digitalWrite(RC522_RST_PIN, HIGH); // Сбрасываем модуль
+    delayMicroseconds(2);              // Ждем 2 мкс
+    digitalWrite(RC522_RST_PIN, LOW);  // Отпускаем сброс
+    rfid.PCD_Init();                   // Инициализируем заного
+  }
+
+  sett.tick();
+  encoderB_tick();
+  blink_tick();
+  beep_logic(beep_freq_temp); // основна функція, яка керує станами
+  handleIncomingPacket();
+
   //************************* РОБОТА З RFID **************************//
   /*if (!rfid.PICC_IsNewCardPresent())
     return;
