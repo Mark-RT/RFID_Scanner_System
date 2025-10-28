@@ -21,7 +21,7 @@ enum kk : size_t // ключі для зберігання в базі дани�
   wifi_pass,
   apply
 };
-sets::Logger logger(150);
+sets::Logger logger(200);
 
 #include <MFRC522.h>
 #define RC522_SS_PIN 27
@@ -74,11 +74,11 @@ enum BeepState
   BEEP_STOP,
   BEEP_ACTIVE,
   BEEP_PAUSE,
+  BEEP_CONTINUOUS,
   BEEP_ENTER,
   BEEP_DENIED,
   BEEP_ONCE,
-  BEEP_WIFI_START,
-  BEEP_CONTINUOUS
+  BEEP_WIFI_START
 };
 BeepState beep_state = BEEP_ONCE;
 BeepState beep_prevState = BEEP_CONTINUOUS;
@@ -104,9 +104,96 @@ bool beep_isOn = false;
 // Налаштування ID для хаба
 uint8_t HUB_ID = 1; // ID хаба (той самий, що HUB_ID у пристрої)
 
+// Write to the SD card
+void writeFile(fs::FS &fs, const char *path, const char *message)
+{
+  Serial.printf("Writing file: %s\n", path);
+
+  File file = fs.open(path, FILE_WRITE);
+  if (!file)
+  {
+    Serial.println("Failed to open file for writing");
+    return;
+  }
+  if (file.print(message))
+  {
+    Serial.println("File written");
+  }
+  else
+  {
+    Serial.println("Write failed");
+  }
+  file.close();
+}
+
+void listDir(fs::FS &fs, const char *dirname, uint8_t levels)
+{
+  Serial.printf("Listing directory: %s\n", dirname);
+
+  File root = fs.open(dirname);
+  if (!root)
+  {
+    Serial.println("Failed to open directory");
+    return;
+  }
+  if (!root.isDirectory())
+  {
+    Serial.println("Not a directory");
+    return;
+  }
+
+  File file = root.openNextFile();
+  while (file)
+  {
+    if (file.isDirectory())
+    {
+      Serial.print("  DIR : ");
+      Serial.println(file.name());
+      logger.print("  DIR : ");
+      logger.println(file.name());
+
+      if (levels)
+      {
+        listDir(fs, file.name(), levels - 1);
+      }
+    }
+    else
+    {
+      Serial.print("  FILE: ");
+      Serial.print(file.name());
+      Serial.print("  SIZE: ");
+      Serial.println(file.size());
+      logger.print("  FILE: ");
+      logger.print(file.name());
+      logger.print("  SIZE: ");
+      logger.println(file.size());
+    }
+    file = root.openNextFile();
+  }
+}
+
+void readFile(fs::FS &fs, const char *path)
+{
+  Serial.printf("Reading file: %s\n", path);
+  logger.println("Reading file in serial");
+
+  File file = fs.open(path);
+  if (!file)
+  {
+    Serial.println("Failed to open file for reading");
+    return;
+  }
+
+  Serial.print("Read from file: ");
+  while (file.available())
+  {
+    Serial.write(file.read());
+  }
+  file.close();
+}
+
 void build(sets::Builder &b)
 {
-  b.Log(H(log), logger);
   if (b.build.isAction())
   {
     Serial.print("Set: 0x");
@@ -121,6 +208,8 @@ void build(sets::Builder &b)
   if (b.beginGroup("Назва та ID"))
   {
     b.Input(kk::hub_id, "ID хаба (за замовчуванням 1):");
+    b.Slider(kk::beeper_web_freq, "Частота зумера:", 100, 5000, 50, "Гц");
+
     b.endGroup(); // НЕ ЗАБЫВАЕМ ЗАВЕРШИТЬ ГРУППУ
   }
 
@@ -130,9 +219,39 @@ void build(sets::Builder &b)
     b.Pass(kk::wifi_ap_pass, "Пароль:");
   }
 
+  if (b.beginGroup("Для розробника"))
   {
-    sets::Group g(b, "Для розробника, відладка");
-    b.Slider(kk::beeper_web_freq, "Частота зумера:", 100, 5000, 50, "Гц");
+    if (b.beginMenu("SD карта"))
+    {
+      b.Log(H(log), logger);
+      if (b.beginRow())
+      {
+        if (b.Button("info"))
+        {
+          Serial.print("info: ");
+          Serial.println(b.build.pressed());
+          uint64_t cardSize = SD.cardSize() / (1024 * 1024);
+          Serial.printf("SD Card Size: %lluMB\n", cardSize);
+          logger.println(cardSize);
+        }
+        if (b.Button("dir"))
+        {
+          Serial.print("dir: ");
+          Serial.println(b.build.pressed());
+          listDir(SD, "/", 0);
+        }
+        if (b.Button("read"))
+        {
+          Serial.print("read: ");
+          Serial.println(b.build.pressed());
+          readFile(SD, "/database.txt");
+        }
+
+        b.endRow();
+      }
+      b.endMenu(); // не забываем завершить меню
+    }
+    b.endGroup(); // НЕ ЗАБЫВАЕМ ЗАВЕРШИТЬ ГРУППУ
   }
 
   {
@@ -551,67 +670,6 @@ void encoderB_tick()
   if (eb.click())
   {
     Serial.println("click");
-  }
-}
-
-// Write to the SD card
-void writeFile(fs::FS &fs, const char *path, const char *message)
-{
-  Serial.printf("Writing file: %s\n", path);
-
-  File file = fs.open(path, FILE_WRITE);
-  if (!file)
-  {
-    Serial.println("Failed to open file for writing");
-    return;
-  }
-  if (file.print(message))
-  {
-    Serial.println("File written");
-  }
-  else
-  {
-    Serial.println("Write failed");
-  }
-  file.close();
-}
-
-void listDir(fs::FS &fs, const char *dirname, uint8_t levels)
-{
-  Serial.printf("Listing directory: %s\n", dirname);
-
-  File root = fs.open(dirname);
-  if (!root)
-  {
-    Serial.println("Failed to open directory");
-    return;
-  }
-  if (!root.isDirectory())
-  {
-    Serial.println("Not a directory");
-    return;
-  }
-
-  File file = root.openNextFile();
-  while (file)
-  {
-    if (file.isDirectory())
-    {
-      Serial.print("  DIR : ");
-      Serial.println(file.name());
-      if (levels)
-      {
-        listDir(fs, file.name(), levels - 1);
-      }
-    }
-    else
-    {
-      Serial.print("  FILE: ");
-      Serial.print(file.name());
-      Serial.print("  SIZE: ");
-      Serial.println(file.size());
-    }
-    file = root.openNextFile();
   }
 }
 

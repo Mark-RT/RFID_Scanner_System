@@ -1,7 +1,6 @@
+gyverlibs/EncButton@^3.7.3
 sandeepmistry/LoRa@^0.8.0
 gyverlibs/GyverBlinker@^1.1.1
-gyverlibs/EncButton@^3.7.3
-gyverlibs/GyverOLED@^1.6.4
-gyverlibs/GyverBeeper@^1.1.0
 gyverlibs/Settings@^1.3.13
+gyverlibs/GyverOLED@^1.6.4
 makerspaceleiden/MFRC522-spi-i2c-uart-async@^1.5.1
