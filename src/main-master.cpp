@@ -64,7 +64,9 @@ enum BlinkState
 BlinkState blink_state = LED_WAIT;
 BlinkState blink_prevState = LED_OFF;
 
-#define BUZZER_PIN 13
+#include <BeepESP.h>
+BeepESP beep;
+#define BUZZER_PIN 26
 #define PWM_CHANNEL 0
 #define PWM_RESOLUTION 8
 
@@ -72,25 +74,13 @@ enum BeepState
 {
   BEEP_IDLE,
   BEEP_STOP,
-  BEEP_ACTIVE,
-  BEEP_PAUSE,
-  BEEP_CONTINUOUS,
   BEEP_ENTER,
   BEEP_DENIED,
-  BEEP_ONCE,
-  BEEP_WIFI_START
+  BEEP_ONCE
 };
 BeepState beep_state = BEEP_ONCE;
-BeepState beep_prevState = BEEP_CONTINUOUS;
-
-uint16_t beep_freq = 0;
+BeepState beep_prevState = BEEP_IDLE;
 uint16_t beep_freq_temp = 0;
-uint8_t beep_count = 0;
-uint8_t beep_current = 0;
-uint16_t beep_onTime = 0;
-uint16_t beep_offTime = 0;
-unsigned long beep_timer = 0;
-bool beep_isOn = false;
 
 // ===== Константи (повинні співпадати з пристроєм) =====
 #define PREAMBLE 0xA5
@@ -316,113 +306,38 @@ void blink_tick()
   }
 }
 
-void beep_init() // Ініціалізація
+void beep_tick(uint16_t freq) // Основна логіка писку з обробкою станів
 {
-  ledcSetup(PWM_CHANNEL, 2000, PWM_RESOLUTION);
-  ledcAttachPin(BUZZER_PIN, PWM_CHANNEL);
-  ledcWrite(PWM_CHANNEL, 0);
-}
+  beep.tick();
 
-void beep_start(uint16_t freq, uint8_t count, uint16_t onTime, uint16_t offTime) // Запуск послідовності писків
-{
-  beep_freq = freq;
-  beep_count = count;
-  beep_current = 0;
-  beep_onTime = onTime;
-  beep_offTime = offTime;
-  beep_isOn = false;
-  beep_timer = millis();
-  beep_state = BEEP_ACTIVE;
-}
-
-void beep_stop() // Зупинка будь-якого писку
-{
-  ledcWrite(PWM_CHANNEL, 0);
-  beep_isOn = false;
-  beep_current = 0;
-  beep_state = BEEP_IDLE;
-}
-
-void beep_tick() // Функція обробки писку (асинхронна)
-{
-  unsigned long now = millis();
-
-  switch (beep_state)
-  {
-  case BEEP_IDLE:
-    // нічого не робимо
-    break;
-
-  case BEEP_ACTIVE:
-    if (!beep_isOn)
-    {
-      ledcWriteTone(PWM_CHANNEL, beep_freq);
-      beep_isOn = true;
-      beep_timer = now;
-    }
-    else if (now - beep_timer >= beep_onTime)
-    {
-      ledcWrite(PWM_CHANNEL, 0);
-      beep_isOn = false;
-      beep_timer = now;
-      beep_current++;
-      if (beep_current >= beep_count)
-      {
-        beep_stop();
-      }
-      else
-      {
-        beep_state = BEEP_PAUSE;
-      }
-    }
-    break;
-
-  case BEEP_PAUSE:
-    if (now - beep_timer >= beep_offTime)
-    {
-      beep_state = BEEP_ACTIVE;
-    }
-    break;
-  }
-}
-
-void beep_logic(uint16_t freq) // Основна логіка писку з обробкою станів
-{
   if (beep_state != beep_prevState)
   {
     beep_prevState = beep_state;
 
     switch (beep_state)
     {
+    case BEEP_IDLE:
+      break;
+
     case BEEP_STOP:
-      beep_stop();
+      beep.stop();
       Serial.println("BEEP_STOP");
       break;
 
     case BEEP_ENTER:
-      beep_start(1000, 2, 300, 500);
+      beep.beep(1000, 2, 150, 100);
       Serial.println("BEEP_ENTER");
       break;
 
     case BEEP_DENIED:
-      beep_start(200, 2, 300, 400);
+      beep.beep(200, 1, 400);
       Serial.println("BEEP_DENIED");
       break;
 
     case BEEP_ONCE:
-      beep_start(freq, 1, 1200, 0);
+      beep.beep(freq, 1, 1200);
       Serial.print("BEEP_ONCE: ");
       Serial.println(freq);
-      break;
-
-    case BEEP_WIFI_START:
-      beep_start(950, 3, 300, 600);
-      Serial.println("BEEP_WIFI_START");
-      break;
-
-    case BEEP_CONTINUOUS:
-      ledcWriteTone(PWM_CHANNEL, freq);
-      Serial.println("BEEP_CONTINUOUS");
       break;
 
     default:
@@ -430,7 +345,10 @@ void beep_logic(uint16_t freq) // Основна логіка писку з об
     }
   }
 
-  beep_tick(); // асинхронне оновлення
+  if (beep.isReady())
+  {
+    beep_state = BEEP_IDLE;
+  }
 }
 
 void initFromDB() // Ініціалізація змінних з БД
@@ -678,7 +596,7 @@ void setup()
   Serial.begin(115200);
   SPI.begin();
 
-  beep_init();
+  beep.init(BUZZER_PIN, PWM_CHANNEL, PWM_RESOLUTION);
 
   //=============== ДИСПЛЕЙ ===============
   oled.init();  // инициализация
@@ -868,7 +786,7 @@ void loop()
   sett.tick();
   encoderB_tick();
   blink_tick();
-  beep_logic(beep_freq_temp); // основна функція, яка керує станами
+  beep_tick(beep_freq_temp); // основна функція, яка керує станами
   handleIncomingPacket();
 
   //************************* РОБОТА З RFID **************************//
