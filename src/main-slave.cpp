@@ -87,6 +87,7 @@ enum BeepState
   BEEP_ENTER,
   BEEP_DENIED,
   BEEP_ONCE,
+  BEEP_FOREVER,
   BEEP_WIFI_START
 };
 BeepState beep_state = BEEP_ONCE;
@@ -175,6 +176,12 @@ void build(sets::Builder &b)
           Serial.print("Синій: ");
           Serial.println(b.build.pressed());
           blink_state = LED_WAIT;
+        }
+        if (b.Button("Forever"))
+        {
+          Serial.print("Forever: ");
+          Serial.println(b.build.pressed());
+          beep_state = BEEP_FOREVER;
         }
         b.endRow();
       }
@@ -287,8 +294,14 @@ void beep_tick(uint16_t freq) // Основна логіка писку з об�
       break;
 
     case BEEP_ONCE:
-      beep.beep(freq, 1, 1200);
+      beep.beep(freq, 1, 800);
       Serial.print("BEEP_ONCE: ");
+      Serial.println(freq);
+      break;
+
+    case BEEP_FOREVER:
+      beep.beepForever(freq, 300, 600);
+      Serial.print("BEEP_FOREVER: ");
       Serial.println(freq);
       break;
 

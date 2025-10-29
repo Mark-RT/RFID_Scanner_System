@@ -7,7 +7,9 @@ enum StateMachine
 {
     IDLE,
     ACTIVE,
-    PAUSE
+    FOREVER,
+    PAUSE,
+    PAUSE_FOREVER
 };
 StateMachine _beepESP_state = IDLE;
 
@@ -37,6 +39,17 @@ public:
         _beep_isReady = false;
         _beep_timer = millis();
         _beepESP_state = ACTIVE;
+    }
+
+    void beepForever(uint16_t freq, uint32_t onTime, uint32_t offTime = 0) // Запуск послідовності писків
+    {
+        _freq = freq;
+        _onTime = onTime;
+        _offTime = offTime;
+        _beep_isOn = false;
+        _beep_isReady = true;
+        _beep_timer = millis();
+        _beepESP_state = FOREVER;
     }
 
     void stop() // Зупинка будь-якого писку
@@ -87,12 +100,36 @@ public:
             }
             break;
 
+        case FOREVER:
+            if (!_beep_isOn)
+            {
+                ledcWriteTone(_pwm_channel, _freq);
+                _beep_isOn = true;
+                _beep_timer = now;
+            }
+            else if (now - _beep_timer >= _onTime)
+            {
+                ledcWrite(_pwm_channel, 0);
+                _beep_isOn = false;
+                _beep_timer = now;
+                _beepESP_state = PAUSE_FOREVER;
+            }
+            break;
+
         case PAUSE:
             if (now - _beep_timer >= _offTime)
             {
                 _beepESP_state = ACTIVE;
             }
             break;
+
+        case PAUSE_FOREVER:
+            if (now - _beep_timer >= _offTime)
+            {
+                _beepESP_state = FOREVER;
+            }
+            break;
+
         }
     }
 

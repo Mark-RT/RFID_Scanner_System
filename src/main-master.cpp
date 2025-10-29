@@ -539,18 +539,23 @@ void handleIncomingPacket()
     Serial.print("  Назва: '");
     Serial.print(deviceName);
     Serial.print("'  UID картки: ");
+    String uidStr = "";
     for (uint8_t k = 0; k < uid_len; ++k)
     {
       if (uid_buf[k] < 0x10)
         Serial.print('0');
       Serial.print(uid_buf[k], HEX);
       Serial.print(' ');
+      uidStr += String(uid_buf[k], HEX);
     }
+    uidStr.toUpperCase(); // при желании сделать все символы заглавными
+    logger.println(sets::Logger::warn() + "UID: " + uidStr);
     Serial.println();
 
     // --- Відправляємо текстову відповідь "Дозволено" ---
     buildAndSend(device, msgId, CMD_OPEN, NULL, 0);
     Serial.println("-> CMD_OPEN дозволено");
+    logger.println("Дозволено");
     /*
         // Проста логіка доступу
         if (uid_allowed(uid_buf, uid_len))
