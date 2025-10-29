@@ -12,7 +12,10 @@ enum kk : size_t // ключі для зберігання в базі дани�
 {
   hub_id,
 
-  beeper_web_freq,
+  mosfet_invert, // УДАЛИТЬ
+  mosfet_time,   // УДАЛИТЬ
+
+  beeper_freq,
 
   wifi_ap_ssid,
   wifi_ap_pass,
@@ -21,7 +24,8 @@ enum kk : size_t // ключі для зберігання в базі дани�
   wifi_pass,
   apply
 };
-sets::Logger logger(200);
+sets::Logger logger(150);
+sets::Logger loggerSDcard(200);
 
 #include <MFRC522.h>
 #define RC522_SS_PIN 27
@@ -184,6 +188,7 @@ void readFile(fs::FS &fs, const char *path)
 
 void build(sets::Builder &b)
 {
+  b.Log(H(log), logger);
   if (b.build.isAction())
   {
     Serial.print("Set: 0x");
@@ -198,8 +203,13 @@ void build(sets::Builder &b)
   if (b.beginGroup("Назва та ID"))
   {
     b.Input(kk::hub_id, "ID хаба (за замовчуванням 1):");
-    b.Slider(kk::beeper_web_freq, "Частота зумера:", 100, 5000, 50, "Гц");
+    b.endGroup(); // НЕ ЗАБЫВАЕМ ЗАВЕРШИТЬ ГРУППУ
+  }
 
+  if (b.beginGroup("MOSFET"))
+  {
+    b.Switch(kk::mosfet_invert, "Інверсія MOSFET:");
+    b.Slider(kk::mosfet_time, "Час затримки:", 1, 60, 1, "сек");
     b.endGroup(); // НЕ ЗАБЫВАЕМ ЗАВЕРШИТЬ ГРУППУ
   }
 
@@ -211,9 +221,10 @@ void build(sets::Builder &b)
 
   if (b.beginGroup("Для розробника"))
   {
-    if (b.beginMenu("SD карта"))
+    if (b.beginMenu("Тест, SD карта"))
     {
-      b.Log(H(log), logger);
+      b.Log(H(logSDcard), loggerSDcard);
+      b.Slider(kk::beeper_freq, "Частота:", 100, 5000, 50, "Гц");
       if (b.beginRow())
       {
         if (b.Button("info"))
@@ -222,7 +233,7 @@ void build(sets::Builder &b)
           Serial.println(b.build.pressed());
           uint64_t cardSize = SD.cardSize() / (1024 * 1024);
           Serial.printf("SD Card Size: %lluMB\n", cardSize);
-          logger.println(cardSize);
+          loggerSDcard.println(cardSize);
         }
         if (b.Button("dir"))
         {
@@ -236,7 +247,6 @@ void build(sets::Builder &b)
           Serial.println(b.build.pressed());
           readFile(SD, "/database.txt");
         }
-
         b.endRow();
       }
       b.endMenu(); // не забываем завершить меню
@@ -262,11 +272,11 @@ void build(sets::Builder &b)
 
   switch (b.build.id)
   {
-  case kk::beeper_web_freq:
+  case kk::beeper_freq:
     Serial.print("Введено частоту: ");
     Serial.println(b.build.value);
-    logger.print("Введено частоту: ");
-    logger.println(b.build.value);
+    loggerSDcard.print("Введено частоту: ");
+    loggerSDcard.println(b.build.value);
     beep_freq_temp = b.build.value;
     beep_state = BEEP_ONCE;
     break;
@@ -277,6 +287,7 @@ void update(sets::Updater &upd)
 {
   // отправить лог
   upd.update(H(log), logger);
+  upd.update(H(logSDcard), loggerSDcard);
 }
 
 void blink_tick()
@@ -705,14 +716,17 @@ void setup()
 
   db.begin();
   db.init(kk::hub_id, 1);
-  db.init(kk::beeper_web_freq, 1000);
+  db.init(kk::mosfet_invert, false);
+  db.init(kk::mosfet_time, 2);
+  db.init(kk::beeper_freq, 1000);
   db.init(kk::wifi_ap_ssid, "HUB_RFID");
   db.init(kk::wifi_ap_pass, "12345678");
-  db.init(kk::wifi_ssid, "");
-  db.init(kk::wifi_pass, "");
+  db.init(kk::wifi_ssid, "TP-LINK_4CA4");
+  db.init(kk::wifi_pass, "75813284");
 
   // ======== WIFI ========
   setStampZone(2); // годинний пояс
+
   if (db[kk::wifi_ssid].length())
   {
     WiFi.begin(db[kk::wifi_ssid], db[kk::wifi_pass]);
