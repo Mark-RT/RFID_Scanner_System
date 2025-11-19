@@ -449,12 +449,13 @@ bool buildAndSend(uint8_t to, uint16_t msgId, uint8_t type, const uint8_t *paylo
   uint8_t buf[256];
   size_t idx = 0;
   buf[idx++] = PREAMBLE;            // 0 – службовий байт, початок пакета
-  buf[idx++] = DEVICE_ID;           // 1 – src: ID відправника (цей пристрій)
-  buf[idx++] = to;                  // 2 – dst: кому надсилаємо (HUB_ID)
-  buf[idx++] = (msgId >> 8) & 0xFF; // 3 – msgId (старший байт)
-  buf[idx++] = msgId & 0xFF;        // 4 – msgId (молодший байт)
-  buf[idx++] = type;                // 5 - тип пакета/запиту
-  buf[idx++] = len;                 // 6 - payload довжина
+  buf[idx++] = DEVICE_ACCESS_LEVEL; // 1 – access_level відправника
+  buf[idx++] = DEVICE_ID;           // 2 – src: ID відправника (цей пристрій)
+  buf[idx++] = to;                  // 3 – dst: кому надсилаємо (HUB_ID)
+  buf[idx++] = (msgId >> 8) & 0xFF; // 4 – msgId (старший байт)
+  buf[idx++] = msgId & 0xFF;        // 5 – msgId (молодший байт)
+  buf[idx++] = type;                // 6 - тип пакета/запиту
+  buf[idx++] = len;                 // 7 - payload довжина
   if (len && payload)
   {
     memcpy(&buf[idx], payload, len); // Копіюємо payload у пакет

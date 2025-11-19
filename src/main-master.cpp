@@ -38,6 +38,14 @@ bool rfid_active = false;
 String uidStr = "";
 String surname_name = "";
 uint8_t access_level = 0;
+enum RfidState
+{
+  RFID_IDLE,
+  RFID_ADD_CARD,
+  RFID_SCAN_CARD,
+  RFID_WAIT_REMOVE_CARD
+};
+RfidState rfid_state = RFID_IDLE;
 
 #include <LoRa.h>
 #define LORA_NSS_PIN 17
@@ -51,6 +59,9 @@ uint16_t RETRIES_TIMEOUT = 500; // час до наступної спроби
 #include <FS.h>
 #define SD_CS 14
 const char *DB_FILE_NAME = "/mydatabase.csv";
+String name_DB;
+int8_t access_level_DB;
+String date_time_DB;
 
 #include <EncButton.h>
 EncButton eb(36, 39, 34);
@@ -77,6 +88,7 @@ enum BlinkState
   BLINK_IDLE,
   LED_OFF,
   LED_WAIT,
+  LED_DENIED
 };
 BlinkState blink_state = LED_WAIT;
 BlinkState blink_prevState = LED_OFF;
@@ -198,6 +210,51 @@ void readFile(fs::FS &fs, const char *path)
   file.close();
 }
 
+bool findUser(String uid, String &outName, int8_t &outLevel, String &outDateTime)
+{
+  File f = SD.open(DB_FILE_NAME);
+  if (!f)
+    return false;
+
+  while (f.available())
+  {
+    String line = f.readStringUntil('\n');
+    line.trim();
+    if (line.length() == 0)
+      continue;
+
+    // Парсимо першу кому (UID)
+    int c1 = line.indexOf(',');
+    if (c1 == -1)
+      continue;
+
+    String uidField = line.substring(0, c1);
+
+    if (uidField == uid)
+    {
+      // Знайшли запис! Тепер парсимо інше
+      int c2 = line.indexOf(',', c1 + 1);
+      int c3 = line.indexOf(',', c2 + 1);
+
+      if (c2 == -1 || c3 == -1)
+      {
+        f.close();
+        return false; // некоректний рядок
+      }
+
+      outName = line.substring(c1 + 1, c2);
+      outLevel = line.substring(c2 + 1, c3).toInt();
+      outDateTime = line.substring(c3 + 1);
+
+      f.close();
+      return true;
+    }
+  }
+
+  f.close();
+  return false; // UID не знайдено
+}
+
 bool uidExists(String uid)
 {
   File f = SD.open(DB_FILE_NAME);
@@ -207,7 +264,6 @@ bool uidExists(String uid)
   while (f.available())
   {
     String line = f.readStringUntil('\n');
-
     int commaIndex = line.indexOf(',');
     if (commaIndex == -1)
       continue;
@@ -251,6 +307,7 @@ bool addRecord(String uid, String name, int level)
   return true;
 }
 
+// ===== ФУНКЦІЇ РОБОТИ З ДИСПЛЕЄМ =====
 void clear_area_for_menu()
 {
   oled.clear(0, 8, 127, 63); // Очистити область під меню
@@ -306,6 +363,7 @@ void clean_adding_form()
   access_level = 0;
 }
 
+// ===== ФУНКЦІЇ НАЛАШТУВАННЯ СТОРІНКИ =====
 void build(sets::Builder &b)
 {
   b.Log(H(log), logger);
@@ -424,6 +482,7 @@ void build(sets::Builder &b)
     notice_scan_card = true;
     show_on_Display(LINE_WAIT_CARD);
     rfid_active = true;
+    rfid_state = RFID_ADD_CARD;
     break;
 
   case "surname_name"_h:
@@ -478,6 +537,7 @@ void update(sets::Updater &upd)
   }
 }
 
+// ===== ІНШІ ФУНКЦІЇ =====
 void blink_tick()
 {
   led_R.tick();
@@ -501,7 +561,18 @@ void blink_tick()
       led_B.blinkForever(300, 1500);
       logger.println("Blue LED blink");
       break;
+
+    case LED_DENIED:
+      Serial.println(LED_DENIED);
+      led_R.blink(1, 500);
+      break;
     }
+  }
+
+  if (led_R.ready())
+  {
+    Serial.println("Червоний перестав");
+    blink_state = LED_WAIT;
   }
 }
 
@@ -529,7 +600,7 @@ void beep_tick(uint16_t freq) // Основна логіка писку з об�
       break;
 
     case BEEP_DENIED:
-      beep.beep(200, 1, 400);
+      beep.beep(250, 2, 200, 250);
       Serial.println("BEEP_DENIED");
       break;
 
@@ -553,6 +624,12 @@ void beep_tick(uint16_t freq) // Основна логіка писку з об�
 void initFromDB() // Ініціалізація змінних з БД
 {
   HUB_ID = (uint8_t)db.get(kk::hub_id);
+  led_R.invert(1);
+  led_R.blink(1, 200, 0);
+  led_G.invert(1);
+  led_G.blink(1, 200, 0);
+  led_B.invert(1);
+  led_B.blink(1, 200, 0);
 }
 
 // ---- CRC8 ----
@@ -633,11 +710,12 @@ void handleIncomingPacket()
     return;                                      // Пакет пошкоджений, вихід
   }
 
-  uint8_t device = buf[1];                                     // ID пристрою-відправника
-  uint8_t hub = buf[2];                                        // ID хаба-отримувача
-  uint16_t msgId = (uint16_t(buf[3]) << 8) | uint16_t(buf[4]); // msgId (2 байти)
-  uint8_t type = buf[5];                                       // Тип пакета (TYPE_REQ, TYPE_ACK тощо)
-  uint8_t len = buf[6];                                        // Довжина payload
+  uint8_t accessLevel = buf[1];                                // Рівень доступу пристрою-відправника
+  uint8_t device = buf[2];                                     // ID пристрою-відправника
+  uint8_t hub = buf[3];                                        // ID хаба-отримувача
+  uint16_t msgId = (uint16_t(buf[4]) << 8) | uint16_t(buf[5]); // msgId (2 байти)
+  uint8_t type = buf[6];                                       // Тип пакета (TYPE_REQ, TYPE_ACK тощо)
+  uint8_t len = buf[7];                                        // Довжина payload
 
   // Перевіряємо, що пакет призначений хабу (HUB_ID) або broadcast (0)
   if (hub != HUB_ID && hub != 0)
@@ -650,7 +728,7 @@ void handleIncomingPacket()
   if (type == TYPE_REQ) // Якщо пакет — запит від сканера
   {
     // Розбираємо payload: [name_len][name_bytes][uid_len][uid_bytes]
-    uint8_t name_len = buf[7]; // Перший байт payload — довжина імені
+    uint8_t name_len = buf[8]; // Перший байт payload — довжина імені
 
     if (len < 2 || ((size_t)name_len > len - 2)) // Мінімум name_len + 1 byte для uid_len
     {
@@ -664,12 +742,12 @@ void handleIncomingPacket()
     {
       char tmp[129];                                            // Тимчасовий буфер для імені
       size_t copy_len = min((size_t)name_len, sizeof(tmp) - 1); // Копіюємо тільки скільки влазить
-      memcpy(tmp, &buf[8], copy_len);                           // Копіюємо байти імені з пакета
+      memcpy(tmp, &buf[9], copy_len);                           // Копіюємо байти імені з пакета
       tmp[copy_len] = '\0';                                     // Додаємо нуль-термінатор
       deviceName = String(tmp);                                 // Створюємо String з буфера
     }
 
-    size_t uid_len_index = 8 + name_len; // Індекс байта, де починається uid_len
+    size_t uid_len_index = 9 + name_len; // Індекс байта, де починається uid_len
     if (uid_len_index >= (size_t)i)      // Перевірка виходу за межі буфера
     {
       Serial.println("Payload truncated before uid_len");
@@ -722,6 +800,14 @@ void handleIncomingPacket()
       Serial.println("Прийнятий UID є в БД, дозволено!");
       logger.println(sets::Logger::warn() + "UID: " + uidDeviceStr + " дозволено");
       buildAndSend(device, msgId, CMD_OPEN, NULL, 0);
+
+      if (findUser(uidDeviceStr, name_DB, access_level_DB, date_time_DB))
+      {
+        Serial.println("Користувача знайдено!");
+        Serial.println("Name: " + name_DB);
+        Serial.println("Level: " + String(access_level_DB));
+        Serial.println("DateTime: " + date_time_DB);
+      }
     }
     else
     {
@@ -771,6 +857,17 @@ void encoderB_tick()
   if (eb.click())
   {
     Serial.println("click");
+    switch (enc_button_state)
+    {
+    case 1:
+      rfid_active = true;
+      rfid_state = RFID_SCAN_CARD;
+      show_on_Display(LINE_WAIT_CARD);
+      break;
+
+    default:
+      break;
+    }
   }
 
   if (eb.turn())
@@ -1003,18 +1100,53 @@ void loop()
     }
     uidStr.toUpperCase(); // зробити великі літери
     Serial.println("UID: " + uidStr);
-
-    if (uidExists(uidStr))
-    {
-      Serial.println("Картка вже в БД");
-      alert_check_uid_DB = true;
-      uidStr = "";
-    }
-
-    rfid_active = false;
     show_on_Display(LINE_UID, uidStr);
-    show_on_Display(LINE_MENU, "", enc_button_state);
 
+    switch (rfid_state)
+    {
+    case RFID_IDLE:
+      break;
+
+    case RFID_ADD_CARD:
+      if (uidExists(uidStr))
+      {
+        Serial.println("Картка вже в БД");
+        alert_check_uid_DB = true;
+        uidStr = "";
+      }
+      show_on_Display(LINE_MENU, "", enc_button_state);
+      break;
+
+    case RFID_SCAN_CARD:
+      if (findUser(uidStr, name_DB, access_level_DB, date_time_DB))
+      {
+        Serial.println("Користувача знайдено!");
+        Serial.println("Name: " + name_DB);
+        Serial.println("Level: " + String(access_level_DB));
+        Serial.println("DateTime: " + date_time_DB);
+        clear_area_for_menu();
+        oled.setScale(1);
+        oled.setCursor(0, 3);
+        oled.println(name_DB);
+        oled.println(access_level_DB);
+        oled.println(date_time_DB);
+      }
+      else
+      {
+        clear_area_for_menu();
+        oled.setScale(2);
+        oled.setCursor(0, 2);
+        oled.println("Невiдомий UID!");
+        blink_state = LED_DENIED;
+        beep_state = BEEP_DENIED;
+      }
+      break;
+
+    default:
+      break;
+    }
+    rfid_state = RFID_IDLE;
+    rfid_active = false;
     rfid.PICC_HaltA();
     rfid.PCD_StopCrypto1();
   }
