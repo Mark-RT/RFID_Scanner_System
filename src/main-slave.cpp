@@ -48,9 +48,9 @@ MFRC522::StatusCode status; // об'єкт статусу
 #define LORA_NSS_PIN 17
 #define LORA_RST_PIN 16
 #define LORA_DIO0_PIN 4
-const unsigned long ACK_TIMEOUT = 800; // мілісекунд очікування підтвердження
-const uint8_t MAX_RETRIES = 10;
-uint16_t RETRIES_TIMEOUT = 300; // час до наступної спроби
+const uint16_t ACK_TIMEOUT = 1000;    // мілісекунд очікування підтвердження відповіді від хаба
+const uint8_t MAX_RETRIES = 7;        // макс. кількість спроб відправки повідомлення
+const uint16_t RETRIES_TIMEOUT = 400; // час до наступної спроби
 
 #include <Blinker.h>
 #define LED_R_PIN 25
@@ -97,7 +97,6 @@ uint16_t beep_freq_temp = 0;
 // ---- Налаштування / константи ----
 #define PREAMBLE 0xA5
 #define TYPE_REQ 0x10
-#define TYPE_REG 0x01
 #define CMD_OPEN 0x12
 #define CMD_DENY 0x13
 #define MAX_NAME_CHARS 20
@@ -110,7 +109,7 @@ uint8_t DEVICE_ID = 0;
 uint8_t HUB_ID = 1;
 uint16_t msgCounter = 0;
 
-void build(sets::Builder &b)
+void build(sets::Builder &b) // БІЛДЕР ВЕБ-ІНТЕРФЕЙСУ
 {
   b.Log(H(log), logger);
   if (b.build.isAction())
@@ -259,7 +258,7 @@ void blink_tick(uint8_t relay_tim, uint8_t mosfet_tim)
     }
   }
 
-   if (relay.ready())
+  if (relay.ready())
   {
     blink_state = LED_WAIT;
   }
@@ -321,33 +320,46 @@ void beep_tick(uint16_t freq) // Основна логіка писку з об�
   }
 }
 
-size_t utf8_truncate_by_chars(const char *src, char *dst, size_t max_chars, size_t dst_buf_size)
+size_t utf8_truncate_by_chars(const char *src, char *dst, size_t max_chars, size_t dst_buf_size) // Функція обрізає UTF-8 рядок до max_chars символів
 {
+  // гарантуючи, що багатобайтові символи (українські) не будуть "порізані" посередині.
+
+  // Перевірка: джерело або призначення відсутні, або розмір вихідного буфера 0.
+  // У такому разі нічого зробити не можемо — повертаємо 0.
   if (!src || !dst || dst_buf_size == 0)
     return 0;
-  size_t src_i = 0;
-  size_t dst_i = 0;
-  size_t chars = 0;
 
+  // Індекси для проходу по вхідному та вихідному рядках
+  size_t src_i = 0; // на якому байті вхідного рядка зараз знаходимось
+  size_t dst_i = 0; // на якому байті вихідного буфера записуємо
+  size_t chars = 0; // скільки UTF-8 символів уже скопійовано
+
+  // Основний цикл: поки не кінець джерела і не перевищено max_chars
   while (src[src_i] != '\0' && chars < max_chars)
   {
+    // Поточний байт джерела, інтерпретований як unsigned (важливо!)
     unsigned char c = (unsigned char)src[src_i];
-    size_t char_len = 1;
-    if ((c & 0x80) == 0x00)
-      char_len = 1; // ASCII
-    else if ((c & 0xE0) == 0xC0)
-      char_len = 2; // 2-byte
-    else if ((c & 0xF0) == 0xE0)
-      char_len = 3; // 3-byte
-    else if ((c & 0xF8) == 0xF0)
-      char_len = 4; // 4-byte
-    else
-      break; // невідомий байт — безпечний вихід
 
-    // переконаємось, що є всі байти в src і місце в dst
+    // Довжина символа в UTF-8 у байтах. За замовчуванням – 1.
+    size_t char_len = 1;
+
+    // Визначаємо кількість байтів у UTF-8 символі за правилами:
+    if ((c & 0x80) == 0x00)
+      char_len = 1; // 0xxxxxxx — ASCII (1 байт)
+    else if ((c & 0xE0) == 0xC0)
+      char_len = 2; // 110xxxxx — багатобайтовий символ з 2 байтів
+    else if ((c & 0xF0) == 0xE0)
+      char_len = 3; // 1110xxxx — 3-байтовий символ (типово для кирилиці)
+    else if ((c & 0xF8) == 0xF0)
+      char_len = 4; // 11110xxx — 4 байти (емодзі, рідкісні символи)
+    else
+      break; // якщо байт не відповідає жодному патерну — виходимо
+
+    // Перевірка: чи є в джерелі всі необхідні байти цього символа?
     bool ok = true;
     for (size_t k = 0; k < char_len; k++)
     {
+      // Якщо раптом символ обривається (недостатньо байтів) — не копіювати
       if (src[src_i + k] == '\0')
       {
         ok = false;
@@ -356,19 +368,27 @@ size_t utf8_truncate_by_chars(const char *src, char *dst, size_t max_chars, size
     }
     if (!ok)
       break;
-    if (dst_i + char_len >= dst_buf_size)
-      break; // місця не вистачає для копіювання + '\0'
 
-    // скопіювати байти
+    // Перевірка: чи вистачає місця у dst для цього символу + кінцевого '\0'?
+    if (dst_i + char_len >= dst_buf_size)
+      break; // якщо не влазить — зупиняємо копіювання
+
+    // Копіюємо всі байти цього UTF-8 символа у вихідний буфер
     for (size_t k = 0; k < char_len; k++)
       dst[dst_i++] = src[src_i + k];
+
+    // Переходимо до наступного символа в src
     src_i += char_len;
+
+    // Збільшуємо лічильник копійованих символів
     chars++;
   }
 
-  // term
+  // Завершуємо рядок нуль-термінатором
   dst[dst_i] = '\0';
-  return dst_i; // повертаємо байтову довжину (без '\0')
+
+  // Повертаємо кількість БАЙТІВ записаних у dst (без нуль-термінатора)
+  return dst_i;
 }
 
 void initFromDB() // Ініціалізація змінних з БД
@@ -388,50 +408,49 @@ void initFromDB() // Ініціалізація змінних з БД
   char tmp[128];
   s.toCharArray(tmp, sizeof(tmp));
   utf8_truncate_by_chars(tmp, deviceNameBuf, MAX_NAME_CHARS, sizeof(deviceNameBuf));
-  // deviceNameBuf тепер містить UTF-8 зріз (null-terminated)
 }
 
 // ---- CRC8 ----
 uint8_t crc8(const uint8_t *data, size_t len)
 {
-  uint8_t crc = 0x00;
-  while (len--)
+  uint8_t crc = 0x00; // Початкове значення CRC (seed)
+  while (len--)       // Проходимо всі байти масиву
   {
-    uint8_t b = *data++;
-    for (uint8_t i = 0; i < 8; i++)
+    uint8_t b = *data++;            // Беремо наступний байт та зсуваємо вказівник
+    for (uint8_t i = 0; i < 8; i++) // Обробляємо кожен з 8 бітів байта
     {
-      uint8_t mix = (crc ^ b) & 0x01;
-      crc >>= 1;
-      if (mix)
-        crc ^= 0x8C;
-      b >>= 1;
+      uint8_t mix = (crc ^ b) & 0x01; // mix = XOR молодших бітів CRC і байта
+      crc >>= 1;                      // Зсуваємо CRC праворуч
+      if (mix)                        // Якщо mix = 1 – треба XOR з поліномом
+        crc ^= 0x8C;                  // 0x8C — поліном CRC8 (Dallas/Maxim)
+      b >>= 1;                        // Зсуваємо вхідний байт праворуч
     }
   }
-  return crc;
+  return crc; // Повертаємо обчислений CRC
 }
 
 // ---- buildAndSend: src = DEVICE_ID, dst = to ----
-uint8_t buildAndSend(uint8_t to, uint16_t msgId, uint8_t type, const uint8_t *payload, uint8_t len)
+bool buildAndSend(uint8_t to, uint16_t msgId, uint8_t type, const uint8_t *payload, uint8_t len)
 {
   if (len > MAX_TOTAL_PAYLOAD)
     return 1; // payload занадто великий
 
   uint8_t buf[256];
   size_t idx = 0;
-  buf[idx++] = PREAMBLE;            // 0
-  buf[idx++] = DEVICE_ID;           // 1 - src (правильно!)
-  buf[idx++] = to;                  // 2 - dst
-  buf[idx++] = (msgId >> 8) & 0xFF; // 3 - msgId hi
-  buf[idx++] = msgId & 0xFF;        // 4 - msgId lo
-  buf[idx++] = type;                // 5 - type
-  buf[idx++] = len;                 // 6 - payload len
+  buf[idx++] = PREAMBLE;            // 0 – службовий байт, початок пакета
+  buf[idx++] = DEVICE_ID;           // 1 – src: ID відправника (цей пристрій)
+  buf[idx++] = to;                  // 2 – dst: кому надсилаємо (HUB_ID)
+  buf[idx++] = (msgId >> 8) & 0xFF; // 3 – msgId (старший байт)
+  buf[idx++] = msgId & 0xFF;        // 4 – msgId (молодший байт)
+  buf[idx++] = type;                // 5 - тип пакета/запиту
+  buf[idx++] = len;                 // 6 - payload довжина
   if (len && payload)
   {
-    memcpy(&buf[idx], payload, len);
+    memcpy(&buf[idx], payload, len); // Копіюємо payload у пакет
     idx += len;
   }
-  uint8_t crc = crc8(buf, idx);
-  buf[idx++] = crc;
+  uint8_t crc = crc8(buf, idx); // CRC рахується по всіх попередніх байтах
+  buf[idx++] = crc;             // Додаємо CRC у кінець пакета
 
   // --- DEBUG: вивід сформованого пакета по байтах для відладки ---
   Serial.println("Packet dump (index : 0xHEX):");
@@ -454,93 +473,106 @@ uint8_t buildAndSend(uint8_t to, uint16_t msgId, uint8_t type, const uint8_t *pa
 }
 
 // ---- waitForResponse: читати packetSize, мінімум 8 байт ----
-// Оновлений waitForResponse: додаємо max size для outPayload
+// додаємо max size для outPayload
 bool waitForResponse(uint16_t expectedMsgId, unsigned long timeout,
-                     uint8_t *outType, uint8_t *outPayload, uint8_t *outLen, size_t outPayloadMaxLen)
+                     uint8_t *outType, uint8_t *outPayload, uint8_t *outLen,
+                     size_t outPayloadMaxLen)
 {
-  unsigned long t0 = millis();
-  while (millis() - t0 < timeout)
+  unsigned long t0 = millis(); // Фіксуємо час старту очікування
+
+  while (millis() - t0 < timeout) // Крутимо цикл, доки не минув timeout
   {
-    int packetSize = LoRa.parsePacket();
-    if (packetSize > 0)
+    int packetSize = LoRa.parsePacket(); // Перевіряємо, чи прийшов пакет LoRa
+                                         // Повертає >0 якщо пакет доступний
+
+    if (packetSize > 0) // Якщо пакет дійсно є
     {
-      uint8_t buf[256];
-      int i = 0;
-      while (i < packetSize && LoRa.available() && i < (int)sizeof(buf))
-        buf[i++] = LoRa.read();
+      uint8_t buf[256]; // Буфер для зчитування всього прийнятого пакету
+      int i = 0;        // Лічильник фактично прочитаних байтів
 
-      if (i < 8)
-        continue; // мінімум 8 байт (preamble..crc)
-      if (buf[0] != PREAMBLE)
-        continue;
+      while (i < packetSize &&     // Читаємо тільки заявлений розмір пакета
+             LoRa.available() &&   // Поки є байти в LoRa буфері
+             i < (int)sizeof(buf)) // І поки не переповнюємо наш локальний буфер
+        buf[i++] = LoRa.read();    // Зчитуємо байт у buf[i] і збільшуємо i
 
-      uint8_t recv_crc = buf[i - 1];
-      if (crc8(buf, i - 1) != recv_crc)
-        continue;
+      if (i < 8)  // Пакет менше мінімально дозволених 8 байт?
+        continue; // Пропускаємо його (це сміття)
 
-      uint8_t from = buf[1];
-      uint8_t to = buf[2];
-      uint16_t msgId = (uint16_t(buf[3]) << 8) | uint16_t(buf[4]);
-      uint8_t type = buf[5];
-      uint8_t len = buf[6];
+      if (buf[0] != PREAMBLE) // Перевірка першого байта — стартовий маркер пакета
+        continue;             // Якщо не співпадає — не наш пакет
 
-      // перевірка адресата (DEVICE_ID) або broadcast (0)
+      uint8_t recv_crc = buf[i - 1];    // Останній байт отриманого пакета — CRC
+      if (crc8(buf, i - 1) != recv_crc) // Обчислюємо CRC від усіх попередніх байтів
+        continue;                       // CRC не співпав — пакет зіпсований, ігноруємо
+
+      uint8_t from = buf[1];                                       // Адреса відправника пакета
+      uint8_t to = buf[2];                                         // Адреса отримувача (має бути цього пристрою)
+      uint16_t msgId = (uint16_t(buf[3]) << 8) | uint16_t(buf[4]); // Старший байт msgId Молодший байт msgId (двобайтове число)
+      uint8_t type = buf[5];                                       // Тип повідомлення (команда/відповідь)
+      uint8_t len = buf[6];                                        // Довжина payload у байтах
+
+      // Перевірка, чи пакет адресований нам або broadcast (0)
       if (to != DEVICE_ID && to != 0)
-        continue;
-      if (msgId != expectedMsgId)
-        continue;
+        continue; // Не нам — пропускаємо
 
-      // Захист від некоректного len в пакеті
-      if ((int)len > i - 8)
-        continue;
+      if (msgId != expectedMsgId) // Перевіряємо чи це відповідь на наше запитання
+        continue;                 // MsgId не співпав — не наша відповідь
 
-      if (outType)
-        *outType = type;
-      if (outLen)
-        *outLen = len;
-      if (outPayload && len)
+      // Перевірка коректності поля len
+      if ((int)len > i - 8) // len не може бути більшим, ніж реальний залишок пакета
+        continue;           // Якщо більший — пакет некоректний
+
+      if (outType)       // Якщо вказівник не NULL
+        *outType = type; // Записуємо тип пакета у змінну користувача
+
+      if (outLen)      // Якщо користувач хоче отримати довжину payload
+        *outLen = len; // Записуємо її
+
+      if (outPayload && len) // Якщо є куди копіювати payload
       {
-        if ((size_t)len > outPayloadMaxLen)
-          continue; // пакет невідповідний або обрізаний — ігноруємо
-        memcpy(outPayload, &buf[7], len);
+        if ((size_t)len > outPayloadMaxLen) // Якщо payload більший, ніж дозволена довжина буфера
+          continue;                         // Ігноруємо цей пакет (не влазить)
+
+        memcpy(outPayload, &buf[7], len); // Копіюємо payload, який починається з buf[7]
       }
-      return true;
+
+      return true; // Пакет валідний, правильний, і відправлений нам.
     }
   }
-  return false;
+
+  return false; // Час вийшов, відповідь не отримано
 }
 
 // Оновлений sendUidWithName: НЕ інкрементує msgCounter; приймає msgId як параметр
 bool sendUidWithName(uint8_t hubId, uint16_t msgId, const uint8_t *uidBytes, uint8_t uidLen)
 {
-  if (!uidBytes || uidLen == 0 || uidLen > MAX_UID_LEN)
+  if (!uidBytes || uidLen == 0 || uidLen > MAX_UID_LEN) // Перевірка коректності UID: нема вказівника, довжина = 0, UID занадто довгий
     return false;
 
-  // Безпечний підрахунок байтів імені (обмеження MAX_NAME_BYTES)
-  size_t nameBytes = strnlen(deviceNameBuf, MAX_NAME_BYTES);
+  size_t nameBytes = strnlen(deviceNameBuf, MAX_NAME_BYTES); // Безпечний підрахунок байтів імені (обмеження MAX_NAME_BYTES)
   if (nameBytes > MAX_NAME_BYTES)
     nameBytes = MAX_NAME_BYTES;
 
-  size_t payloadLen = 1 + nameBytes + 1 + uidLen;                               // додаткові службові байти
-  if (payloadLen > MAX_TOTAL_PAYLOAD || payloadLen > sizeof(uint8_t) * 256 - 8) // перевірка чи не перевищили ліміт
+  // Розрахунок загальної довжини корисного навантаження
+  size_t payloadLen = 1 + nameBytes + 1 + uidLen;                               // додаткові службові байти: 1 байт — довжина імені, nameBytes — сам текст імені, 1 байт — довжина UID, uidLen — сам UID
+  if (payloadLen > MAX_TOTAL_PAYLOAD || payloadLen > sizeof(uint8_t) * 256 - 8) // перевірка чи не перевищили ліміт протоколу LoRa
     return false;
 
   uint8_t payload[256];
   size_t idx = 0;
-  payload[idx++] = (uint8_t)nameBytes;
+  payload[idx++] = (uint8_t)nameBytes; // першим записуємо довжину імені
   if (nameBytes)
   {
-    memcpy(&payload[idx], deviceNameBuf, nameBytes);
+    memcpy(&payload[idx], deviceNameBuf, nameBytes); // копіюємо ім’я цілком
     idx += nameBytes;
   }
-  payload[idx++] = uidLen;
-  memcpy(&payload[idx], uidBytes, uidLen);
+
+  payload[idx++] = uidLen;                 // записуємо довжину UID
+  memcpy(&payload[idx], uidBytes, uidLen); // копіюємо сам UID
   idx += uidLen;
 
-  // buildAndSend повертає 0 при успіху
-  bool ok = (buildAndSend(hubId, msgId, TYPE_REQ, payload, (uint8_t)payloadLen) == 0);
-  // Переводимо радіомодуль у режим прийому
-  LoRa.receive();
+  bool ok = (buildAndSend(hubId, msgId, TYPE_REQ, payload, (uint8_t)payloadLen) == 0); // buildAndSend повертає 1 при успіху
+  LoRa.receive();                                                                      // Переводимо радіомодуль у режим прийому
   return ok;
 }
 
@@ -549,17 +581,20 @@ void setup()
   Serial.begin(115200);
   SPI.begin();
 
+  // ======== BEEP ========
   beep.init(BUZZER_PIN, PWM_CHANNEL, PWM_RESOLUTION);
 
   rfid.PCD_Init();
-  rfid.PCD_SetAntennaGain(rfid.RxGain_avg); // Установка усиления антенны
+  rfid.PCD_SetAntennaGain(rfid.RxGain_max); // Установка усиления антенны
   rfid.PCD_AntennaOff();                    // Перезагружаем антенну
-  rfid.PCD_AntennaOn();                     // Включаем антенну
+  delay(50);
+  rfid.PCD_AntennaOn(); // Включаем антенну
   for (byte i = 0; i < 6; i++)
   {                        // Наполняем ключ
     key.keyByte[i] = 0xFF; // Ключ по умолчанию 0xFFFFFFFFFFFF
   }
 
+  // ======== LORA ========
   Serial.print("LoRa init ");
   LoRa.setPins(LORA_NSS_PIN, LORA_RST_PIN, LORA_DIO0_PIN); // setup LoRa transceiver module
   int a = 5;                                               // кількість спроб ініціалізації LoRa
@@ -572,7 +607,8 @@ void setup()
   }
   a > 0 ? Serial.println("success") : Serial.println("failed");
 
-  WiFi.mode(WIFI_AP_STA); // ======== WIFI ========
+  // ======== WIFI ========
+  WiFi.mode(WIFI_AP_STA);
 
   // ======== SETTINGS ========
   sett.begin();
@@ -603,13 +639,13 @@ void setup()
   db.init(kk::wifi_ssid, "");
   db.init(kk::wifi_pass, "");
 
-  // часовой пояс для rtc
-  setStampZone(2);
+  // ======== WIFI ========
+  setStampZone(2); // годинний пояс
 
   if (db[kk::wifi_ssid].length())
   {
     WiFi.begin(db[kk::wifi_ssid], db[kk::wifi_pass]);
-    Serial.print("Connect STA ");
+    Serial.print("Connect to " + db[kk::wifi_ssid]);
     int tries = 15;
     while (WiFi.status() != WL_CONNECTED)
     {
@@ -683,7 +719,7 @@ void loop()
       uidStr += "0";
     uidStr += String(rfid.uid.uidByte[i], HEX);
   }
-  uidStr.toUpperCase(); // при желании сделать все символы заглавными
+  uidStr.toUpperCase(); // зробити великі літери
   logger.println(sets::Logger::warn() + "UID: " + uidStr);
   Serial.println("UID: " + uidStr);
 
@@ -700,7 +736,7 @@ void loop()
       // Викликаємо утиліту, яка сформує payload і відправить (не інкрементує msgCounter)
       if (!sendUidWithName(HUB_ID, msgId, rfid.uid.uidByte, rfid.uid.size))
       {
-        Serial.println("Failed to build/send payload");
+        Serial.println("Помилка відправки повідомлення");
         break; // немає сенсу повторювати, payload некоректний
       }
 
@@ -728,7 +764,7 @@ void loop()
       {
         tries++;
         retries_timeout_temp = millis();
-        Serial.print("No response, retry ");
+        Serial.print("Нема відповіді, спроба ");
         Serial.println(tries);
       }
     }
