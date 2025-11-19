@@ -7,6 +7,10 @@ GyverDBFile db(&LittleFS, "/data.db");
 
 #include <SettingsGyver.h>
 SettingsGyver sett("HUB RFID", &db);
+bool notice_scan_card;
+bool notice_add_card;
+bool alert_check_uid_DB;
+bool alert_surname_name;
 
 enum kk : size_t // ключі для зберігання в базі даних
 {
@@ -30,6 +34,10 @@ sets::Logger loggerSDcard(200);
 MFRC522 rfid(RC522_SS_PIN, RC522_RST_PIN);
 MFRC522::MIFARE_Key key;    // об'єкт ключа
 MFRC522::StatusCode status; // об'єкт статусу
+bool rfid_active = false;
+String uidStr = "";
+String surname_name = "";
+uint8_t access_level = 0;
 
 #include <LoRa.h>
 #define LORA_NSS_PIN 17
@@ -42,6 +50,7 @@ uint16_t RETRIES_TIMEOUT = 500; // час до наступної спроби
 #include <SD.h>
 #include <FS.h>
 #define SD_CS 14
+const char *DB_FILE_NAME = "/mydatabase.csv";
 
 #include <EncButton.h>
 EncButton eb(36, 39, 34);
@@ -53,7 +62,7 @@ enum DisplayInfo
 {
   LINE_UID, // Показує UID на першому рядку
   LINE_MENU,
-  LINE_MESSAGE // Додаткові повідомлення
+  LINE_WAIT_CARD
 };
 
 #include <Blinker.h>
@@ -101,7 +110,7 @@ uint16_t beep_freq_temp = 0;
 // Налаштування ID для хаба
 uint8_t HUB_ID = 1; // ID хаба (той самий, що HUB_ID у пристрої)
 
-// Write to the SD card
+// ===== ФУНКЦІЇ РОБОТИ З SD КАРТОЮ =====
 void writeFile(fs::FS &fs, const char *path, const char *message)
 {
   Serial.printf("Writing file: %s\n", path);
@@ -189,101 +198,57 @@ void readFile(fs::FS &fs, const char *path)
   file.close();
 }
 
-void build(sets::Builder &b)
+bool uidExists(String uid)
 {
-  b.Log(H(log), logger);
-  if (b.build.isAction())
-  {
-    Serial.print("Set: 0x");
-    Serial.print(b.build.id, HEX);
-    Serial.print(" = ");
-    Serial.println(b.build.value);
+  File f = SD.open(DB_FILE_NAME);
+  if (!f)
+    return false;
 
-    logger.print("Set: 0x");
-    logger.println(b.build.id, HEX);
-  }
-
-  if (b.beginGroup("Назва та ID"))
+  while (f.available())
   {
-    b.Input(kk::hub_id, "ID хаба (за замовчуванням 1):");
-    b.endGroup(); // НЕ ЗАБЫВАЕМ ЗАВЕРШИТЬ ГРУППУ
-  }
+    String line = f.readStringUntil('\n');
 
-  {
-    sets::Group g(b, "WiFi налаштування точки");
-    b.Input(kk::wifi_ap_ssid, "SSID:");
-    b.Pass(kk::wifi_ap_pass, "Пароль:");
-  }
+    int commaIndex = line.indexOf(',');
+    if (commaIndex == -1)
+      continue;
 
-  if (b.beginGroup("Для розробника"))
-  {
-    if (b.beginMenu("Тест, SD карта"))
+    String uidField = line.substring(0, commaIndex);
+
+    if (uidField == uid)
     {
-      b.Log(H(logSDcard), loggerSDcard);
-      b.Slider(kk::beeper_freq, "Частота:", 100, 5000, 50, "Гц");
-      if (b.beginRow())
-      {
-        if (b.Button("info"))
-        {
-          Serial.print("info: ");
-          Serial.println(b.build.pressed());
-          uint64_t cardSize = SD.cardSize() / (1024 * 1024);
-          Serial.printf("SD Card Size: %lluMB\n", cardSize);
-          loggerSDcard.println(cardSize);
-        }
-        if (b.Button("dir"))
-        {
-          Serial.print("dir: ");
-          Serial.println(b.build.pressed());
-          listDir(SD, "/", 0);
-        }
-        if (b.Button("read"))
-        {
-          Serial.print("read: ");
-          Serial.println(b.build.pressed());
-          readFile(SD, "/database.txt");
-        }
-        b.endRow();
-      }
-      b.endMenu(); // не забываем завершить меню
+      f.close();
+      return true;
     }
-    b.endGroup(); // НЕ ЗАБЫВАЕМ ЗАВЕРШИТЬ ГРУППУ
   }
 
-  {
-    sets::Group g(b, "WiFi роутер");
-    b.Input(kk::wifi_ssid, "SSID:");
-    b.Pass(kk::wifi_pass, "Пароль:");
-  }
-
-  if (b.beginButtons())
-  {
-    if (b.Button(kk::apply, "Save & Restart"))
-    {
-      db.update(); // сохраняем БД не дожидаясь таймаута
-      ESP.restart();
-    }
-    b.endButtons(); // завершить кнопки
-  }
-
-  switch (b.build.id)
-  {
-  case kk::beeper_freq:
-    Serial.print("Введено частоту: ");
-    Serial.println(b.build.value);
-    loggerSDcard.print("Введено частоту: ");
-    loggerSDcard.println(b.build.value);
-    beep_freq_temp = b.build.value;
-    beep_state = BEEP_ONCE;
-    break;
-  }
+  f.close();
+  return false;
 }
 
-void update(sets::Updater &upd)
+bool addRecord(String uid, String name, int level)
 {
-  // отправить лог
-  upd.update(H(log), logger);
-  upd.update(H(logSDcard), loggerSDcard);
+  String dt = sett.rtc.toString();
+
+  File f = SD.open(DB_FILE_NAME, FILE_APPEND);
+  if (!f)
+  {
+    Serial.println("DB open error");
+    return false;
+  }
+
+  f.print(uid);
+  f.print(",");
+  f.print(name);
+  f.print(",");
+  f.print(level);
+  f.print(",");
+  f.println(dt);
+
+  f.close();
+
+  Serial.println("Запис зроблено:");
+  Serial.println(uid + "," + name + "," + level + "," + dt);
+  return true;
 }
 
 void clear_area_for_menu()
@@ -326,8 +291,195 @@ void show_on_Display(DisplayInfo line, const String &text = "", uint8_t page = 0
     }
     break;
 
+  case LINE_WAIT_CARD:
+    clear_area_for_menu();
+    oled.setScale(2);
+    oled.setCursor(0, 2);
+    oled.print("Очiкую картку...");
+    Serial.println("OLED: Очiкую картку...");
+    break;
+
   default:
     break;
+  }
+}
+
+void clean_adding_form()
+{
+  uidStr = "";
+  surname_name = "";
+  access_level = 0;
+}
+
+void build(sets::Builder &b)
+{
+  b.Log(H(log), logger);
+  if (b.build.isAction())
+  {
+    Serial.print("Set: 0x");
+    Serial.print(b.build.id, HEX);
+    Serial.print(" = ");
+    Serial.println(b.build.value);
+
+    logger.print("Set: 0x");
+    logger.println(b.build.id, HEX);
+  }
+
+  if (b.beginGroup("Назва та ID"))
+  {
+    b.Input(kk::hub_id, "ID хаба (за замовчуванням 1):");
+    b.endGroup(); // НЕ ЗАБЫВАЕМ ЗАВЕРШИТЬ ГРУППУ
+  }
+
+  {
+    sets::Group g(b, "WiFi налаштування точки");
+    b.Input(kk::wifi_ap_ssid, "SSID:");
+    b.Pass(kk::wifi_ap_pass, "Пароль:");
+  }
+
+  if (b.beginGroup("Для розробника"))
+  {
+    if (b.beginMenu("Тест, SD карта"))
+    {
+      b.Log(H(logSDcard), loggerSDcard);
+      b.Slider(kk::beeper_freq, "Частота:", 100, 5000, 50, "Гц");
+      if (b.beginRow())
+      {
+        if (b.Button("info"))
+        {
+          Serial.print("info: ");
+          Serial.println(b.build.pressed());
+          uint64_t cardSize = SD.cardSize() / (1024 * 1024);
+          Serial.printf("SD Card Size: %lluMB\n", cardSize);
+          loggerSDcard.println(String(cardSize) + " MB");
+        }
+        if (b.Button("dir"))
+        {
+          Serial.print("dir: ");
+          Serial.println(b.build.pressed());
+          listDir(SD, "/", 0);
+        }
+        if (b.Button("read"))
+        {
+          Serial.print("read: ");
+          Serial.println(b.build.pressed());
+          readFile(SD, DB_FILE_NAME);
+        }
+        b.endRow();
+      }
+      b.endMenu(); // не забываем завершить меню
+    }
+    b.endGroup(); // НЕ ЗАБЫВАЕМ ЗАВЕРШИТЬ ГРУППУ
+  }
+
+  if (b.beginGroup("Дії з карткою:"))
+  {
+    if (b.beginMenu("Прошивка й додавання в БД"))
+    {
+      b.Button("scan_card"_h, "Сканувати картку");
+      b.Label("uid_label"_h, "UID картки:");
+      b.Input("surname_name"_h, "Прізвище та ім'я:");
+      b.Select("access_level"_h, "Рівень доступу:", "низький;середній;високий");
+
+      b.Button("write_add_card"_h, "Прошити й додати в БД");
+      bool res;
+      if (b.Confirm("conf"_h, "Додати запис?", &res))
+      {
+        if (res)
+        {
+          addRecord(uidStr, surname_name, access_level);
+          clean_adding_form();
+          b.reload();
+        }
+      }
+      b.endMenu(); // не забываем завершить меню
+    }
+    b.endGroup(); // НЕ ЗАБЫВАЕМ ЗАВЕРШИТЬ ГРУППУ
+  }
+  {
+    sets::Group g(b, "WiFi роутер");
+    b.Input(kk::wifi_ssid, "SSID:");
+    b.Pass(kk::wifi_pass, "Пароль:");
+  }
+
+  if (b.beginButtons())
+  {
+    if (b.Button(kk::apply, "Save & Restart"))
+    {
+      db.update(); // сохраняем БД не дожидаясь таймаута
+      ESP.restart();
+    }
+    b.endButtons(); // завершить кнопки
+  }
+
+  switch (b.build.id)
+  {
+  case kk::beeper_freq:
+    Serial.print("Введено частоту: ");
+    Serial.println(b.build.value);
+    loggerSDcard.print("Введено частоту: ");
+    loggerSDcard.println(b.build.value);
+    beep_freq_temp = b.build.value;
+    beep_state = BEEP_ONCE;
+    break;
+
+  case "scan_card"_h:
+    Serial.println("Натиснув сканувати картку");
+    clean_adding_form();
+    notice_scan_card = true;
+    show_on_Display(LINE_WAIT_CARD);
+    rfid_active = true;
+    break;
+
+  case "surname_name"_h:
+    Serial.print("Введено ім'я: ");
+    Serial.println(b.build.value);
+    surname_name = b.build.value;
+    break;
+
+  case "access_level"_h:
+    Serial.print("Вибрано рівень доступу: ");
+    Serial.println(b.build.value);
+    access_level = b.build.value.toInt();
+    break;
+
+  case "write_add_card"_h:
+    Serial.print("Натиснув додати картку з UID: ");
+    Serial.println(b.build.value);
+    if (surname_name != "")
+      notice_add_card = true;
+      else
+      alert_surname_name = true;
+
+    break;
+  }
+}
+
+void update(sets::Updater &upd)
+{
+  // отправить лог
+  upd.update(H(log), logger);
+  upd.update(H(logSDcard), loggerSDcard);
+  upd.update("uid_label"_h, uidStr);
+  if (notice_scan_card)
+  {
+    notice_scan_card = false;
+    upd.notice("Відскануйте картку!");
+  }
+  if (notice_add_card)
+  {
+    notice_add_card = false;
+    upd.confirm("conf"_h);
+  }
+  if (alert_check_uid_DB)
+  {
+    alert_check_uid_DB = false;
+    upd.alert("UID вже існує в БД!");
+  }
+  if (alert_surname_name)
+  {
+    alert_surname_name = false;
+    upd.alert("Введіть прізвище та ім'я!");
   }
 }
 
@@ -689,7 +841,7 @@ void setup()
 
   //================= SD CARD ====================
   Serial.print("Initializing SD card ");
-  a = 5; // кількість спроб ініціалізації LoRa
+  a = 5; // кількість спроб ініціалізації
   while (!SD.begin(SD_CS))
   {
     Serial.print(".");
@@ -714,19 +866,17 @@ void setup()
     oled.println("SD карта вiдсутня");
   }
 
-  // If the data.txt file doesn't exist
-  // Create a file on the SD card and write the data labels
-  File file = SD.open("/database.txt");
+  File file = SD.open(DB_FILE_NAME);
   if (!file)
   {
-    Serial.println("Файл database.txt не знайдено");
+    Serial.println("Файл не знайдено");
     Serial.println("Створення файлу...");
     oled.println("Нема файлу. Створення...");
-    writeFile(SD, "/database.txt", "Epoch Time, Temperature, Humidity, Pressure \r\n");
+    writeFile(SD, DB_FILE_NAME, "UID,Name,Level,DateTime \r\n");
   }
   else
   {
-    Serial.println("Файл database.txt знайдено");
+    Serial.println("Файл знайдено");
     oled.println("Файл -> OK");
   }
   file.close();
@@ -775,7 +925,8 @@ void setup()
     }
     if (WiFi.status() == WL_CONNECTED)
     {
-      oled.println("WiFi пiдключений");
+      oled.println("WiFi ");
+      oled.println(WiFi.localIP());
       Serial.println(WiFi.localIP());
     }
     else
@@ -844,19 +995,34 @@ void loop()
   handleIncomingPacket();
 
   //************************* РОБОТА З RFID **************************//
-  /*if (!rfid.PICC_IsNewCardPresent())
-    return;
-  if (!rfid.PICC_ReadCardSerial())
-    return;
 
-  // Логування UID
-  Serial.print("UID: ");
-  for (uint8_t i = 0; i < rfid.uid.size; i++)
+  if (rfid_active)
   {
-    if (rfid.uid.uidByte[i] < 0x10)
-      Serial.print('0');
-    Serial.print(rfid.uid.uidByte[i], HEX);
-    Serial.print(' ');
+    if (!rfid.PICC_IsNewCardPresent() || !rfid.PICC_ReadCardSerial())
+      return;
+
+    uidStr = "";
+    for (uint8_t i = 0; i < rfid.uid.size; i++)
+    {
+      if (rfid.uid.uidByte[i] < 0x10)
+        uidStr += "0";
+      uidStr += String(rfid.uid.uidByte[i], HEX);
+    }
+    uidStr.toUpperCase(); // зробити великі літери
+    Serial.println("UID: " + uidStr);
+
+    if (uidExists(uidStr))
+    {
+      Serial.println("Картка вже в БД");
+      alert_check_uid_DB = true;
+      uidStr = "";
+    }
+
+    rfid_active = false;
+    show_on_Display(LINE_UID, uidStr);
+    show_on_Display(LINE_MENU, "", enc_button_state);
+
+    rfid.PICC_HaltA();
+    rfid.PCD_StopCrypto1();
   }
-  Serial.println();*/
 }
