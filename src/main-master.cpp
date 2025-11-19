@@ -275,18 +275,13 @@ void show_on_Display(DisplayInfo line, const String &text = "", uint8_t page = 0
     switch (page)
     {
     case 1:
-      oled.print("1. Прошити й додати в БД");
-      Serial.println("OLED: 1. Прошити й додати в БД");
+      oled.print("1. Info по картцi");
+      Serial.println("OLED: 1. Info по картцi");
       break;
 
     case 2:
-      oled.print("2. Info по картцi");
-      Serial.println("OLED: 2. Info по картцi");
-      break;
-
-    case 3:
-      oled.print("3. Видалити картку з БД");
-      Serial.println("OLED: 3. Видалити картку з БД");
+      oled.print("2. Видалити картку з БД");
+      Serial.println("OLED: 2. Видалити картку з БД");
       break;
     }
     break;
@@ -448,7 +443,7 @@ void build(sets::Builder &b)
     Serial.println(b.build.value);
     if (surname_name != "")
       notice_add_card = true;
-      else
+    else
       alert_surname_name = true;
 
     break;
@@ -711,32 +706,30 @@ void handleIncomingPacket()
     Serial.print(deviceName);
     Serial.print("'  UID картки: ");
 
-    String uidStr = "";
+    String uidDeviceStr = "";
     for (uint8_t k = 0; k < uid_len; ++k) // Формуємо рядок для логу
     {
       if (uid_buf[k] < 0x10)
-        Serial.print('0');
-      Serial.print(uid_buf[k], HEX);
-      Serial.print(' ');
-      uidStr += String(uid_buf[k], HEX);
+        uidDeviceStr += "0"; // Додаємо провідний нуль для однобайтових значень
+      uidDeviceStr += String(uid_buf[k], HEX);
     }
-    uidStr.toUpperCase(); // Приводимо до великих літер
-    logger.println(sets::Logger::warn() + "UID: " + uidStr);
-    Serial.println();
+    uidDeviceStr.toUpperCase(); // Приводимо до великих літер
+    Serial.println(uidDeviceStr);
+    show_on_Display(LINE_UID, uidDeviceStr);
 
-    // --- Відправляємо текстову відповідь "Дозволено" ---
-    buildAndSend(device, msgId, CMD_OPEN, NULL, 0); // Надсилаємо відкриття
-    show_on_Display(LINE_UID, uidStr);
-    Serial.println("-> CMD_OPEN дозволено");
-    logger.println("Дозволено");
-
-    /*
-        // Тут можна вставити перевірку за списком дозволених UID
-        if (uid_allowed(uid_buf, uid_len))
-            buildAndSend(device, msgId, CMD_OPEN, NULL, 0);
-        else
-            buildAndSend(device, msgId, CMD_DENY, NULL, 0);
-    */
+    if (uidExists(uidDeviceStr)) // Перевірка наявності UID в БД
+    {
+      Serial.println("Прийнятий UID є в БД, дозволено!");
+      logger.println(sets::Logger::warn() + "UID: " + uidDeviceStr + " дозволено");
+      buildAndSend(device, msgId, CMD_OPEN, NULL, 0);
+    }
+    else
+    {
+      Serial.println("Прийнятий UID відсутній в БД, відмова!");
+      logger.println(sets::Logger::error() + "UID: " + uidDeviceStr + " відмова");
+      buildAndSend(device, msgId, CMD_DENY, NULL, 0);
+      return;
+    }
   }
   else // Якщо type відмінний від TYPE_REQ
   {
@@ -760,8 +753,8 @@ void encoderB_tick()
   if (eb.right())
   {
     enc_button_state++;
-    if (enc_button_state >= 3)
-      enc_button_state = 3;
+    if (enc_button_state >= 2)
+      enc_button_state = 2;
     Serial.println("right");
   }
 
@@ -925,7 +918,7 @@ void setup()
     }
     if (WiFi.status() == WL_CONNECTED)
     {
-      oled.println("WiFi ");
+      oled.print("WiFi ");
       oled.println(WiFi.localIP());
       Serial.println(WiFi.localIP());
     }

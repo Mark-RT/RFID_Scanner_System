@@ -10,6 +10,7 @@ SettingsGyver sett("RFID сканер", &db);
 enum kk : size_t // ключі для зберігання в базі даних
 {
   device_name,
+  access_level,
   device_id,
   hub_id,
 
@@ -48,9 +49,9 @@ MFRC522::StatusCode status; // об'єкт статусу
 #define LORA_NSS_PIN 17
 #define LORA_RST_PIN 16
 #define LORA_DIO0_PIN 4
-const uint16_t ACK_TIMEOUT = 1000;    // мілісекунд очікування підтвердження відповіді від хаба
-const uint8_t MAX_RETRIES = 7;        // макс. кількість спроб відправки повідомлення
-const uint16_t RETRIES_TIMEOUT = 400; // час до наступної спроби
+const uint16_t ACK_TIMEOUT = 800;    // мілісекунд очікування підтвердження відповіді від хаба
+const uint8_t MAX_RETRIES = 3;        // макс. кількість спроб відправки повідомлення
+const uint16_t RETRIES_TIMEOUT = 300; // час до наступної спроби
 
 #include <Blinker.h>
 #define LED_R_PIN 25
@@ -69,6 +70,7 @@ enum BlinkState
   BLINK_IDLE,
   LED_OFF,
   LED_WAIT,
+  LED_DENIED,
   RELAY_ON
 };
 BlinkState blink_state = LED_WAIT;
@@ -106,6 +108,7 @@ uint16_t beep_freq_temp = 0;
 
 char deviceNameBuf[MAX_NAME_BYTES + 1]; // тут зберігаємо UTF-8 назву (байти)
 uint8_t DEVICE_ID = 0;
+uint8_t DEVICE_ACCESS_LEVEL = 0;
 uint8_t HUB_ID = 1;
 uint16_t msgCounter = 0;
 
@@ -126,6 +129,7 @@ void build(sets::Builder &b) // БІЛДЕР ВЕБ-ІНТЕРФЕЙСУ
   if (b.beginGroup("Назва та ID"))
   {
     b.Input(kk::device_name, "Назва точки:");
+    b.Select(kk::access_level, "Рівень доступу:", "низький;середній;високий");
     b.Input(kk::device_id, "ID точки:");
     b.Input(kk::hub_id, "ID хаба (за замовчуванням 1):");
     b.endGroup(); // НЕ ЗАБЫВАЕМ ЗАВЕРШИТЬ ГРУППУ
@@ -255,10 +259,14 @@ void blink_tick(uint8_t relay_tim, uint8_t mosfet_tim)
       mosfet.blink(1, mosfet_tim * 1000, 0); // включаем MOSFET на mosfet_time секунд
       led_G.blink(1, relay_tim * 1000, 0);
       break;
+
+    case LED_DENIED:
+      led_R.blink(1, 500, 0);
+      break;
     }
   }
 
-  if (relay.ready())
+  if (relay.ready() || led_R.ready())
   {
     blink_state = LED_WAIT;
   }
@@ -288,7 +296,7 @@ void beep_tick(uint16_t freq) // Основна логіка писку з об�
       break;
 
     case BEEP_DENIED:
-      beep.beep(200, 1, 400);
+      beep.beep(250, 1, 500);
       Serial.println("BEEP_DENIED");
       break;
 
@@ -394,12 +402,15 @@ size_t utf8_truncate_by_chars(const char *src, char *dst, size_t max_chars, size
 void initFromDB() // Ініціалізація змінних з БД
 {
   relay_time_temp = db.get(kk::relay_time);
-  mosfet_time_temp = db.get(kk::mosfet_time);
-
   relay.invert(db.get(kk::relay_invert));
+  relay.blink(1, 400, 0);
+
+  mosfet_time_temp = db.get(kk::mosfet_time);
   mosfet.invert(db.get(kk::mosfet_invert));
+  mosfet.blink(1, 400, 0);
 
   // отримуємо ID як uint8_t
+  DEVICE_ACCESS_LEVEL = (uint8_t)db.get(kk::access_level);
   DEVICE_ID = (uint8_t)db.get(kk::device_id);
   HUB_ID = (uint8_t)db.get(kk::hub_id);
 
@@ -625,6 +636,7 @@ void setup()
 
   db.begin();
   db.init(kk::device_name, "Назва...");
+  db.init(kk::access_level, (uint8_t)1);
   db.init(kk::device_id, 0);
   db.init(kk::hub_id, 1);
   db.init(kk::relay_invert, false);
@@ -755,6 +767,7 @@ void loop()
         else if (respType == CMD_DENY)
         {
           Serial.println("DENY command received");
+          blink_state = LED_DENIED;
           beep_state = BEEP_DENIED;
         }
         success = true;
