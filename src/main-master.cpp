@@ -7,26 +7,26 @@ GyverDBFile db(&LittleFS, "/data.db");
 
 #include <SettingsGyver.h>
 SettingsGyver sett("HUB RFID", &db);
+bool notice_success;
 bool notice_scan_card;
 bool notice_add_card;
+bool notice_edit_card;
 bool alert_check_uid_DB;
 bool alert_surname_name;
+bool alert_find_uid_DB;
 
 enum kk : size_t // ключі для зберігання в базі даних
 {
   hub_id,
-
   beeper_freq,
-
   wifi_ap_ssid,
   wifi_ap_pass,
-
   wifi_ssid,
   wifi_pass,
   apply
 };
-sets::Logger logger(150);
-sets::Logger loggerSDcard(200);
+sets::Logger logger(200);
+sets::Logger loggerSDcard(1000);
 
 #include <MFRC522.h>
 #define RC522_SS_PIN 27
@@ -35,7 +35,9 @@ MFRC522 rfid(RC522_SS_PIN, RC522_RST_PIN);
 MFRC522::MIFARE_Key key;    // об'єкт ключа
 MFRC522::StatusCode status; // об'єкт статусу
 bool rfid_active = false;
+bool rfid_delete_confirm = false;
 String uidStr = "";
+String uidStr_temp = "";
 String surname_name = "";
 uint8_t access_level = 0;
 enum RfidState
@@ -43,7 +45,9 @@ enum RfidState
   RFID_IDLE,
   RFID_ADD_CARD,
   RFID_SCAN_CARD,
-  RFID_WAIT_REMOVE_CARD
+  RFID_FAST_ADD,
+  RFID_EDIT_CARD_DB,
+  RFID_DELETE_FROM_DB
 };
 RfidState rfid_state = RFID_IDLE;
 
@@ -69,10 +73,15 @@ int8_t enc_button_state = 1; // поточний стан енкодера (1-3)
 
 #include <GyverOLED.h>
 GyverOLED<SSD1306_128x64, OLED_NO_BUFFER> oled;
+bool back_to_home = false;
+uint32_t timing_back_to_home = 0;
 enum DisplayInfo
 {
   LINE_UID, // Показує UID на першому рядку
   LINE_MENU,
+  LINE_DELETE_SUCCESS,
+  LINE_UNKNOWN_UID,
+  LINE_ERROR,
   LINE_WAIT_CARD
 };
 
@@ -88,6 +97,7 @@ enum BlinkState
   BLINK_IDLE,
   LED_OFF,
   LED_WAIT,
+  LED_OK,
   LED_DENIED
 };
 BlinkState blink_state = LED_WAIT;
@@ -103,7 +113,7 @@ enum BeepState
 {
   BEEP_IDLE,
   BEEP_STOP,
-  BEEP_ENTER,
+  BEEP_OK,
   BEEP_DENIED,
   BEEP_ONCE
 };
@@ -190,24 +200,177 @@ void listDir(fs::FS &fs, const char *dirname, uint8_t levels)
   }
 }
 
-void readFile(fs::FS &fs, const char *path)
+void readFile(fs::FS &fs, const char *path, int linesPerChunk = 5)
 {
-  Serial.printf("Reading file: %s\n", path);
-  logger.println("Reading file in serial");
+  loggerSDcard.printf("Reading file: %s\n", path);
 
   File file = fs.open(path);
   if (!file)
   {
-    Serial.println("Failed to open file for reading");
+    loggerSDcard.println("Failed to open file for reading");
     return;
   }
 
-  Serial.print("Read from file: ");
+  int lineCount = 0;
+  String buffer = "";
+
   while (file.available())
   {
-    Serial.write(file.read());
+    String line = file.readStringUntil('\n');
+    line.trim();
+
+    // Додаємо рядок в буфер
+    buffer += line + "\n";
+    lineCount++;
+
+    // Якщо зібрали linesPerChunk рядків — виводимо
+    if (lineCount >= linesPerChunk)
+    {
+      loggerSDcard.println(buffer); // вивід пачки
+
+      // очищаємо для наступних рядків
+      buffer = "";
+      lineCount = 0;
+    }
   }
+
+  // Якщо файл закінчився, а в буфері щось є
+  if (lineCount > 0)
+  {
+    loggerSDcard.println(buffer);
+  }
+
   file.close();
+}
+
+bool deleteUserFromDB(String uid)
+{
+  File inFile = SD.open(DB_FILE_NAME, FILE_READ);
+  if (!inFile)
+    return false;
+
+  // Тимчасовий файл
+  File outFile = SD.open("/tmp.csv", FILE_WRITE);
+  if (!outFile)
+  {
+    inFile.close();
+    return false;
+  }
+
+  bool deleted = false;
+
+  while (inFile.available())
+  {
+    String line = inFile.readStringUntil('\n');
+    line.trim();
+    if (line.length() == 0)
+      continue;
+
+    int c1 = line.indexOf(',');
+    if (c1 == -1)
+      continue;
+
+    String uidField = line.substring(0, c1);
+
+    // Якщо UID співпав — пропускаємо (видаляємо)
+    if (uidField == uid)
+    {
+      deleted = true;
+      continue; // НЕ записуємо рядок в новий файл
+    }
+
+    // Інакше — копіюємо рядок у новий файл
+    outFile.println(line);
+  }
+
+  inFile.close();
+  outFile.close();
+
+  // Якщо запис видалено — замінюємо файл
+  if (deleted)
+  {
+    SD.remove(DB_FILE_NAME);             // видаляємо старий
+    SD.rename("/tmp.csv", DB_FILE_NAME); // замінюємо новим
+  }
+  else
+  {
+    SD.remove("/tmp.csv"); // UID не знайдено — тимчасовий файл зайвий
+  }
+
+  return deleted;
+}
+
+bool editUser(const String &uid, const String &newName, int newLevel)
+{
+  File f = SD.open(DB_FILE_NAME, FILE_READ);
+  if (!f)
+  {
+    Serial.println("Error opening DB for edit");
+    return false;
+  }
+
+  // Тимчасовий файл
+  File tmp = SD.open("/tmp.csv", FILE_WRITE);
+  if (!tmp)
+  {
+    Serial.println("Error creating temp file");
+    f.close();
+    return false;
+  }
+
+  bool replaced = false;
+
+  while (f.available())
+  {
+    String line = f.readStringUntil('\n');
+    line.trim();
+    if (line.length() == 0)
+    {
+      continue;
+    }
+
+    // Заголовок не чіпаємо
+    if (line.startsWith("UID,"))
+    {
+      tmp.println(line);
+      continue;
+    }
+
+    // Парсимо UID
+    int c1 = line.indexOf(',');
+    if (c1 == -1)
+    {
+      tmp.println(line);
+      continue;
+    }
+
+    String uidField = line.substring(0, c1);
+
+    if (uidField == uid)
+    {
+      // Формуємо новий рядок
+      String newLine = uid + ",";
+      newLine += newName + ",";
+      newLine += String(newLevel) + ",";
+      newLine += sett.rtc.toString(); // дата/час
+
+      tmp.println(newLine);
+      replaced = true;
+    }
+    else
+    {
+      tmp.println(line); // залишаємо як було
+    }
+  }
+
+  f.close();
+  tmp.close();
+
+  // Замінюємо старий файл новим
+  SD.remove(DB_FILE_NAME);
+  SD.rename("/tmp.csv", DB_FILE_NAME);
+
+  return replaced;
 }
 
 bool findUser(String uid, String &outName, int8_t &outLevel, String &outDateTime)
@@ -315,6 +478,9 @@ void clear_area_for_menu()
 
 void show_on_Display(DisplayInfo line, const String &text = "", uint8_t page = 0)
 {
+  clear_area_for_menu();
+  oled.setScale(2);
+  oled.setCursor(0, 2);
   switch (line)
   {
   case LINE_UID:
@@ -326,9 +492,6 @@ void show_on_Display(DisplayInfo line, const String &text = "", uint8_t page = 0
     break;
 
   case LINE_MENU:
-    clear_area_for_menu();
-    oled.setScale(2);
-    oled.setCursor(0, 2);
     switch (page)
     {
     case 1:
@@ -337,16 +500,33 @@ void show_on_Display(DisplayInfo line, const String &text = "", uint8_t page = 0
       break;
 
     case 2:
-      oled.print("2. Видалити картку з БД");
-      Serial.println("OLED: 2. Видалити картку з БД");
+      oled.print("2. Швидко додати картку");
+      Serial.println("OLED: 2. Швидко додати картку");
+      break;
+
+    case 3:
+      oled.print("3. Видалити картку з БД");
+      Serial.println("OLED: 3. Видалити картку з БД");
       break;
     }
     break;
 
+  case LINE_DELETE_SUCCESS:
+    Serial.println("Запис успішно видалено!");
+    oled.print("Видалено успiшно!");
+    break;
+
+  case LINE_ERROR:
+    Serial.println("Помилка!");
+    oled.print("Помилка!");
+    break;
+
+  case LINE_UNKNOWN_UID:
+    Serial.println("Невідомий UID!");
+    oled.print("Невiдомий UID!");
+    break;
+
   case LINE_WAIT_CARD:
-    clear_area_for_menu();
-    oled.setScale(2);
-    oled.setCursor(0, 2);
     oled.print("Очiкую картку...");
     Serial.println("OLED: Очiкую картку...");
     break;
@@ -382,12 +562,6 @@ void build(sets::Builder &b)
   {
     b.Input(kk::hub_id, "ID хаба (за замовчуванням 1):");
     b.endGroup(); // НЕ ЗАБЫВАЕМ ЗАВЕРШИТЬ ГРУППУ
-  }
-
-  {
-    sets::Group g(b, "WiFi налаштування точки");
-    b.Input(kk::wifi_ap_ssid, "SSID:");
-    b.Pass(kk::wifi_ap_pass, "Пароль:");
   }
 
   if (b.beginGroup("Для розробника"))
@@ -442,6 +616,29 @@ void build(sets::Builder &b)
         {
           addRecord(uidStr, surname_name, access_level);
           clean_adding_form();
+          notice_success = true;
+          b.reload();
+        }
+      }
+      b.endMenu(); // не забываем завершить меню
+    }
+
+    if (b.beginMenu("Редагувати користувача"))
+    {
+      b.Button("scan_card_edit"_h, "Сканувати картку");
+      b.Label("uid_label_edit"_h, "UID картки:");
+      b.Input("surname_name_edit"_h, "Прізвище та ім'я:");
+      b.Select("access_level_edit"_h, "Рівень доступу:", "низький;середній;високий");
+
+      b.Button("edit_button"_h, "Редагувати");
+      bool res;
+      if (b.Confirm("conf_edit"_h, "Редагувати цей запис?", &res))
+      {
+        if (res)
+        {
+          editUser(uidStr, surname_name, access_level);
+          clean_adding_form();
+          notice_success = true;
           b.reload();
         }
       }
@@ -449,6 +646,13 @@ void build(sets::Builder &b)
     }
     b.endGroup(); // НЕ ЗАБЫВАЕМ ЗАВЕРШИТЬ ГРУППУ
   }
+
+  {
+    sets::Group g(b, "WiFi налаштування точки");
+    b.Input(kk::wifi_ap_ssid, "SSID:");
+    b.Pass(kk::wifi_ap_pass, "Пароль:");
+  }
+
   {
     sets::Group g(b, "WiFi роутер");
     b.Input(kk::wifi_ssid, "SSID:");
@@ -485,13 +689,34 @@ void build(sets::Builder &b)
     rfid_state = RFID_ADD_CARD;
     break;
 
+  case "scan_card_edit"_h:
+    Serial.println("Натиснув сканувати картку edit");
+    clean_adding_form();
+    notice_scan_card = true;
+    show_on_Display(LINE_WAIT_CARD);
+    rfid_active = true;
+    rfid_state = RFID_EDIT_CARD_DB;
+    break;
+
   case "surname_name"_h:
     Serial.print("Введено ім'я: ");
     Serial.println(b.build.value);
     surname_name = b.build.value;
     break;
 
+  case "surname_name_edit"_h:
+    Serial.print("Введено ім'я: ");
+    Serial.println(b.build.value);
+    surname_name = b.build.value;
+    break;
+
   case "access_level"_h:
+    Serial.print("Вибрано рівень доступу: ");
+    Serial.println(b.build.value);
+    access_level = b.build.value.toInt();
+    break;
+
+  case "access_level_edit"_h:
     Serial.print("Вибрано рівень доступу: ");
     Serial.println(b.build.value);
     access_level = b.build.value.toInt();
@@ -504,7 +729,15 @@ void build(sets::Builder &b)
       notice_add_card = true;
     else
       alert_surname_name = true;
+    break;
 
+  case "edit_button"_h:
+    Serial.print("Натиснув Редагувати цей запис з UID: ");
+    Serial.println(b.build.value);
+    if (surname_name != "")
+      notice_edit_card = true;
+    else
+      alert_surname_name = true;
     break;
   }
 }
@@ -515,6 +748,14 @@ void update(sets::Updater &upd)
   upd.update(H(log), logger);
   upd.update(H(logSDcard), loggerSDcard);
   upd.update("uid_label"_h, uidStr);
+  upd.update("uid_label_edit"_h, uidStr);
+  upd.update("surname_name_edit"_h, surname_name);
+  upd.update("access_level_edit"_h, access_level);
+  if (notice_success)
+  {
+    notice_success = false;
+    upd.notice("Успішно!");
+  }
   if (notice_scan_card)
   {
     notice_scan_card = false;
@@ -525,10 +766,20 @@ void update(sets::Updater &upd)
     notice_add_card = false;
     upd.confirm("conf"_h);
   }
+  if (notice_edit_card)
+  {
+    notice_edit_card = false;
+    upd.confirm("conf_edit"_h);
+  }
   if (alert_check_uid_DB)
   {
     alert_check_uid_DB = false;
     upd.alert("UID вже існує в БД!");
+  }
+  if (alert_find_uid_DB)
+  {
+    alert_find_uid_DB = false;
+    upd.alert("UID немає в БД!");
   }
   if (alert_surname_name)
   {
@@ -562,6 +813,11 @@ void blink_tick()
       logger.println("Blue LED blink");
       break;
 
+    case LED_OK:
+      Serial.println(LED_OK);
+      led_G.blink(1, 600);
+      break;
+
     case LED_DENIED:
       Serial.println(LED_DENIED);
       led_R.blink(1, 500);
@@ -569,9 +825,9 @@ void blink_tick()
     }
   }
 
-  if (led_R.ready())
+  if (led_R.ready() || led_G.ready())
   {
-    Serial.println("Червоний перестав");
+    Serial.println("Перестав мерехкотіти");
     blink_state = LED_WAIT;
   }
 }
@@ -594,13 +850,13 @@ void beep_tick(uint16_t freq) // Основна логіка писку з об�
       Serial.println("BEEP_STOP");
       break;
 
-    case BEEP_ENTER:
-      beep.beep(1000, 2, 150, 100);
-      Serial.println("BEEP_ENTER");
+    case BEEP_OK:
+      beep.beep(1200, 2, 200, 100);
+      Serial.println("BEEP_OK");
       break;
 
     case BEEP_DENIED:
-      beep.beep(250, 2, 200, 250);
+      beep.beep(250, 1, 500);
       Serial.println("BEEP_DENIED");
       break;
 
@@ -632,8 +888,7 @@ void initFromDB() // Ініціалізація змінних з БД
   led_B.blink(1, 200, 0);
 }
 
-// ---- CRC8 ----
-uint8_t crc8(const uint8_t *data, size_t len)
+uint8_t crc8(const uint8_t *data, size_t len) // ---- CRC8 ----
 {
   uint8_t crc = 0x00; // Початкове значення CRC (seed)
   while (len--)       // Проходимо всі байти масиву
@@ -682,6 +937,12 @@ bool buildAndSend(uint8_t to, uint16_t msgId, uint8_t type, const uint8_t *paylo
   return 1;
 }
 
+void clean_temp_DB_values()
+{
+  name_DB = "";
+  access_level_DB = 0;
+  date_time_DB = "";
+}
 // ===== Функція прийому і парсингу одного пакета =====
 void handleIncomingPacket()
 {
@@ -795,32 +1056,51 @@ void handleIncomingPacket()
     Serial.println(uidDeviceStr);
     show_on_Display(LINE_UID, uidDeviceStr);
 
-    if (uidExists(uidDeviceStr)) // Перевірка наявності UID в БД
+    if (findUser(uidDeviceStr, name_DB, access_level_DB, date_time_DB)) // Перевірка наявності UID в БД
     {
-      Serial.println("Прийнятий UID є в БД, дозволено!");
-      logger.println(sets::Logger::warn() + "UID: " + uidDeviceStr + " дозволено");
-      buildAndSend(device, msgId, CMD_OPEN, NULL, 0);
+      Serial.println("Прийнятий UID є в БД");
 
-      if (findUser(uidDeviceStr, name_DB, access_level_DB, date_time_DB))
+      if (access_level_DB >= accessLevel)
       {
-        Serial.println("Користувача знайдено!");
-        Serial.println("Name: " + name_DB);
-        Serial.println("Level: " + String(access_level_DB));
-        Serial.println("DateTime: " + date_time_DB);
+        logger.println(sets::Logger::warn() + "UID: " + uidDeviceStr + " дозволено");
+        buildAndSend(device, msgId, CMD_OPEN, NULL, 0);
+      }
+      else
+      {
+        Serial.println("Рівень доступу не ваш, відмова!");
+        logger.println(sets::Logger::error() + "UID: " + uidDeviceStr + " відмова по рівню");
+        buildAndSend(device, msgId, CMD_DENY, NULL, 0);
+        return;
       }
     }
     else
     {
       Serial.println("Прийнятий UID відсутній в БД, відмова!");
-      logger.println(sets::Logger::error() + "UID: " + uidDeviceStr + " відмова");
+      logger.println(sets::Logger::error() + "UID: " + uidDeviceStr + " відмова, не знайдено");
       buildAndSend(device, msgId, CMD_DENY, NULL, 0);
       return;
     }
+    clean_temp_DB_values();
   }
   else // Якщо type відмінний від TYPE_REQ
   {
     Serial.print("Невідомий type "); // Логування
     Serial.println(type);
+  }
+}
+
+void back_to_main_menu(bool was_change = 0)
+{
+  if (was_change)
+  {
+    back_to_home = false;
+    timing_back_to_home = millis();
+  }
+
+  if (!back_to_home && millis() - timing_back_to_home > 3000)
+  {
+    show_on_Display(LINE_MENU, "", enc_button_state);
+    back_to_home = true;
   }
 }
 
@@ -839,8 +1119,8 @@ void encoderB_tick()
   if (eb.right())
   {
     enc_button_state++;
-    if (enc_button_state >= 2)
-      enc_button_state = 2;
+    if (enc_button_state >= 3)
+      enc_button_state = 3;
     Serial.println("right");
   }
 
@@ -865,14 +1145,46 @@ void encoderB_tick()
       show_on_Display(LINE_WAIT_CARD);
       break;
 
+    case 2:
+      rfid_active = true;
+      rfid_state = RFID_FAST_ADD;
+      show_on_Display(LINE_WAIT_CARD);
+      break;
+
+    case 3:
+      if (!rfid_delete_confirm)
+      {
+        rfid_active = true;
+        rfid_state = RFID_DELETE_FROM_DB;
+        show_on_Display(LINE_WAIT_CARD);
+      }
+      else
+      {
+        if (deleteUserFromDB(uidStr_temp))
+        {
+          show_on_Display(LINE_DELETE_SUCCESS);
+          blink_state = LED_OK;
+          beep_state = BEEP_OK;
+        }
+
+        else
+          show_on_Display(LINE_ERROR);
+        back_to_main_menu(1);
+        uidStr_temp = "";
+      }
+      break;
+
     default:
       break;
     }
+
+    rfid_delete_confirm = false;
   }
 
   if (eb.turn())
   {
     Serial.println("turn");
+    back_to_home = true;
     show_on_Display(LINE_MENU, "", enc_button_state);
   }
 }
@@ -904,7 +1216,7 @@ void setup()
     key.keyByte[i] = 0xFF; // Ключ по умолчанию 0xFFFFFFFFFFFF
   }
   oled.println("RFID -> OK");
-  delay(200);
+  delay(100);
 
   //============= LoRa ===============
   Serial.print("LoRa init ");
@@ -927,7 +1239,7 @@ void setup()
     Serial.println("failed");
     oled.println("LoRa -> not find");
   }
-  delay(200);
+  delay(100);
 
   //================= SD CARD ====================
   Serial.print("Initializing SD card ");
@@ -971,8 +1283,7 @@ void setup()
   }
   file.close();
   listDir(SD, "/", 0);
-
-  delay(300);
+  delay(100);
 
   // ======== WIFI ========
   WiFi.mode(WIFI_AP_STA);
@@ -1035,7 +1346,6 @@ void setup()
     {
       Serial.print("Створюю AP ");
       if (WiFi.softAP(db[kk::wifi_ap_ssid], db[kk::wifi_ap_pass]))
-      // if (WiFi.softAP("Testttt", "12345678"))
       {
         apCreated = true;
         break;
@@ -1061,8 +1371,6 @@ void setup()
       oled.println(WiFi.softAPIP());
     }
   }
-  delay(600);
-
   initFromDB();
 }
 
@@ -1083,9 +1391,9 @@ void loop()
   blink_tick();
   beep_tick(beep_freq_temp); // основна функція, яка керує станами
   handleIncomingPacket();
+  back_to_main_menu();
 
   //************************* РОБОТА З RFID **************************//
-
   if (rfid_active)
   {
     if (!rfid.PICC_IsNewCardPresent() || !rfid.PICC_ReadCardSerial())
@@ -1110,9 +1418,28 @@ void loop()
     case RFID_ADD_CARD:
       if (uidExists(uidStr))
       {
-        Serial.println("Картка вже в БД");
+        Serial.println("Картка вже є в БД");
         alert_check_uid_DB = true;
         uidStr = "";
+      }
+      show_on_Display(LINE_MENU, "", enc_button_state);
+      break;
+
+    case RFID_EDIT_CARD_DB:
+      if (findUser(uidStr, name_DB, access_level_DB, date_time_DB))
+      {
+        Serial.println("Користувача для редагування знайдено!");
+        Serial.println("Name: " + name_DB);
+        Serial.println("Level: " + String(access_level_DB));
+        Serial.println("DateTime: " + date_time_DB);
+        surname_name = name_DB;
+        access_level = access_level_DB;
+        clean_temp_DB_values();
+      }
+      else
+      {
+        clean_adding_form();
+        alert_find_uid_DB = true;
       }
       show_on_Display(LINE_MENU, "", enc_button_state);
       break;
@@ -1130,21 +1457,91 @@ void loop()
         oled.println(name_DB);
         oled.println(access_level_DB);
         oled.println(date_time_DB);
+        blink_state = LED_OK;
+        beep_state = BEEP_OK;
       }
       else
       {
         clear_area_for_menu();
-        oled.setScale(2);
-        oled.setCursor(0, 2);
-        oled.println("Невiдомий UID!");
+        show_on_Display(LINE_UNKNOWN_UID);
         blink_state = LED_DENIED;
         beep_state = BEEP_DENIED;
       }
+      uidStr = "";
+      clean_temp_DB_values();
+      back_to_main_menu(1);
+      break;
+
+    case RFID_FAST_ADD:
+      if (uidExists(uidStr))
+      {
+        Serial.println("Картка вже є в БД");
+        clear_area_for_menu();
+        oled.setScale(2);
+        oled.setCursor(0, 2);
+        oled.println("Був такий UID!");
+        blink_state = LED_DENIED;
+        beep_state = BEEP_DENIED;
+      }
+      else
+      {
+        if (addRecord(uidStr, "---- ----", 0))
+        {
+          Serial.println("Картку швидко додано в БД");
+          clear_area_for_menu();
+          oled.setScale(2);
+          oled.setCursor(0, 2);
+          oled.println("Додано!");
+          blink_state = LED_OK;
+          beep_state = BEEP_OK;
+        }
+        else
+        {
+          Serial.println("Помилка при швидкому додаванні в БД");
+          clear_area_for_menu();
+          show_on_Display(LINE_ERROR);
+          blink_state = LED_DENIED;
+          beep_state = BEEP_DENIED;
+        }
+      }
+      uidStr = "";
+      back_to_main_menu(1);
+      break;
+
+    case RFID_DELETE_FROM_DB:
+      if (findUser(uidStr, name_DB, access_level_DB, date_time_DB))
+      {
+        Serial.println("Користувача для видалення знайдено!");
+        Serial.println("Name: " + name_DB);
+        Serial.println("Level: " + String(access_level_DB));
+        Serial.println("DateTime: " + date_time_DB);
+        clear_area_for_menu();
+        oled.setScale(1);
+        oled.setCursor(0, 2);
+        oled.println(name_DB);
+        oled.println(access_level_DB);
+        oled.println(date_time_DB);
+        oled.setScale(2);
+        oled.print("Видалити?");
+        uidStr_temp = uidStr;
+        rfid_delete_confirm = true;
+      }
+      else
+      {
+        clear_area_for_menu();
+        show_on_Display(LINE_UNKNOWN_UID);
+        blink_state = LED_DENIED;
+        beep_state = BEEP_DENIED;
+        uidStr = "";
+        back_to_main_menu(1);
+      }
+      clean_temp_DB_values();
       break;
 
     default:
       break;
     }
+
     rfid_state = RFID_IDLE;
     rfid_active = false;
     rfid.PICC_HaltA();
