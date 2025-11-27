@@ -482,9 +482,12 @@ void clear_area_for_menu()
 
 void show_on_Display(DisplayInfo line, const String &text = "", uint8_t page = 0)
 {
-  clear_area_for_menu();
-  oled.setScale(2);
-  oled.setCursor(0, 2);
+  if (line != LINE_UID)
+  {
+    clear_area_for_menu();
+    oled.setScale(2);
+    oled.setCursor(0, 2);
+  }
   switch (line)
   {
   case LINE_UID:
@@ -1063,6 +1066,59 @@ void handleIncomingPacket()
     // Копіюємо UID у тимчасовий буфер
     uint8_t uid_buf[MAX_UID_LEN];
     memcpy(uid_buf, &buf[uid_start], uid_len);
+
+    // === ПЕРЕВІРКА 6 MAC-БАЙТ ІЗ КАРТКИ ===
+
+    // Обчислюємо індекс початку цих 6 байтів
+    size_t mac_start = uid_start + uid_len;
+
+    // Перевіряємо, що в payload є місце для 6 байт
+    if (mac_start + 6 > (size_t)(8 + len)) // 8 — заг. заголовок LoRa пакета
+    {
+      Serial.println("MAC bytes missing in payload");
+      buildAndSend(device, msgId, CMD_DENY, NULL, 0);
+      return;
+    }
+
+    // Читаємо 6 байт
+    uint8_t cardMac[6];
+    memcpy(cardMac, &buf[mac_start], 6);
+
+    // Порівнюємо з macBytes[]
+    bool mac_ok = true;
+    for (uint8_t j = 0; j < 6; j++)
+    {
+      if (cardMac[j] != macBytes[j])
+      {
+        mac_ok = false;
+        break;
+      }
+    }
+
+    if (!mac_ok)
+    {
+      Serial.println("MAC не співпадає! Відмова.");
+      Serial.print("MAC картки: ");
+      for (int j = 0; j < 6; j++)
+      {
+        Serial.print(cardMac[j], HEX);
+        Serial.print(" ");
+      }
+      Serial.println();
+
+      Serial.print("MAC ESP:    ");
+      for (int j = 0; j < 6; j++)
+      {
+        Serial.print(macBytes[j], HEX);
+        Serial.print(" ");
+      }
+      Serial.println();
+
+      buildAndSend(device, msgId, CMD_DENY, NULL, 0);
+      return;
+    }
+
+    Serial.println("MAC збігається — ок");
 
     // Логування
     Serial.print("REQ від: ");

@@ -44,12 +44,13 @@ uint8_t mosfet_time_temp = 1;
 MFRC522 rfid(RC522_SS_PIN, RC522_RST_PIN);
 MFRC522::MIFARE_Key key;    // об'єкт ключа
 MFRC522::StatusCode status; // об'єкт статусу
+byte block = 7;
 
 #include <LoRa.h>
 #define LORA_NSS_PIN 17
 #define LORA_RST_PIN 16
 #define LORA_DIO0_PIN 4
-const uint16_t ACK_TIMEOUT = 800;    // мілісекунд очікування підтвердження відповіді від хаба
+const uint16_t ACK_TIMEOUT = 800;     // мілісекунд очікування підтвердження відповіді від хаба
 const uint8_t MAX_RETRIES = 3;        // макс. кількість спроб відправки повідомлення
 const uint16_t RETRIES_TIMEOUT = 300; // час до наступної спроби
 
@@ -403,11 +404,11 @@ void initFromDB() // Ініціалізація змінних з БД
 {
   relay_time_temp = db.get(kk::relay_time);
   relay.invert(db.get(kk::relay_invert));
-  relay.blink(1, 400, 0);
+  relay.blink(1, 200, 0);
 
   mosfet_time_temp = db.get(kk::mosfet_time);
   mosfet.invert(db.get(kk::mosfet_invert));
-  mosfet.blink(1, 400, 0);
+  mosfet.blink(1, 200, 0);
 
   // отримуємо ID як uint8_t
   DEVICE_ACCESS_LEVEL = (uint8_t)db.get(kk::access_level);
@@ -556,7 +557,7 @@ bool waitForResponse(uint16_t expectedMsgId, unsigned long timeout,
 }
 
 // Оновлений sendUidWithName: НЕ інкрементує msgCounter; приймає msgId як параметр
-bool sendUidWithName(uint8_t hubId, uint16_t msgId, const uint8_t *uidBytes, uint8_t uidLen)
+bool sendUidWithName(uint8_t hubId, uint16_t msgId, const uint8_t *uidBytes, uint8_t uidLen, const uint8_t *block6)
 {
   if (!uidBytes || uidLen == 0 || uidLen > MAX_UID_LEN) // Перевірка коректності UID: нема вказівника, довжина = 0, UID занадто довгий
     return false;
@@ -566,7 +567,7 @@ bool sendUidWithName(uint8_t hubId, uint16_t msgId, const uint8_t *uidBytes, uin
     nameBytes = MAX_NAME_BYTES;
 
   // Розрахунок загальної довжини корисного навантаження
-  size_t payloadLen = 1 + nameBytes + 1 + uidLen;                               // додаткові службові байти: 1 байт — довжина імені, nameBytes — сам текст імені, 1 байт — довжина UID, uidLen — сам UID
+  size_t payloadLen = 1 + nameBytes + 1 + uidLen + 6;                           // додаткові службові байти: 1 байт — довжина імені, nameBytes — сам текст імені, 1 байт — довжина UID, uidLen — сам UID, 6 байт блоку картки
   if (payloadLen > MAX_TOTAL_PAYLOAD || payloadLen > sizeof(uint8_t) * 256 - 8) // перевірка чи не перевищили ліміт протоколу LoRa
     return false;
 
@@ -582,6 +583,9 @@ bool sendUidWithName(uint8_t hubId, uint16_t msgId, const uint8_t *uidBytes, uin
   payload[idx++] = uidLen;                 // записуємо довжину UID
   memcpy(&payload[idx], uidBytes, uidLen); // копіюємо сам UID
   idx += uidLen;
+
+  memcpy(&payload[idx], block6, 6);
+  idx += 6;
 
   bool ok = (buildAndSend(hubId, msgId, TYPE_REQ, payload, (uint8_t)payloadLen) == 0); // buildAndSend повертає 1 при успіху
   LoRa.receive();                                                                      // Переводимо радіомодуль у режим прийому
@@ -601,10 +605,16 @@ void setup()
   rfid.PCD_AntennaOff();                    // Перезагружаем антенну
   delay(50);
   rfid.PCD_AntennaOn(); // Включаем антенну
-  for (byte i = 0; i < 6; i++)
+  key.keyByte[0] = 0x18;
+  key.keyByte[1] = 0x2F;
+  key.keyByte[2] = 0x37;
+  key.keyByte[3] = 0xE8;
+  key.keyByte[4] = 0x1F;
+  key.keyByte[5] = 0x84;
+  /*for (byte i = 0; i < 6; i++)
   {                        // Наполняем ключ
     key.keyByte[i] = 0xFF; // Ключ по умолчанию 0xFFFFFFFFFFFF
-  }
+  }*/
 
   // ======== LORA ========
   Serial.print("LoRa init ");
@@ -720,10 +730,36 @@ void loop()
   beep_tick(beep_freq_temp); // основна функція, яка керує станами
 
   //************************* РОБОТА З RFID **************************//
-  if (!rfid.PICC_IsNewCardPresent())
+  if (!rfid.PICC_IsNewCardPresent() || !rfid.PICC_ReadCardSerial())
     return;
-  if (!rfid.PICC_ReadCardSerial())
+
+  status = rfid.PCD_Authenticate(MFRC522::PICC_CMD_MF_AUTH_KEY_B, block, &key, &(rfid.uid));
+  if (status != MFRC522::STATUS_OK)
+  {
+    Serial.println("Помилка авторизації"); // Выводим ошибку
+    blink_state = LED_DENIED;
+    beep_state = BEEP_DENIED;
     return;
+  }
+  /* Чтение блока, указываем блок данных #6 */
+  uint8_t dataBlock[18];                                  // Буфер для чтения
+  uint8_t size = sizeof(dataBlock);                       // Размер буфера
+  status = rfid.MIFARE_Read(block - 1, dataBlock, &size); // Читаем 6 блок в буфер
+  if (status != MFRC522::STATUS_OK)
+  {                               // Если не окэй
+    Serial.println("Read error"); // Выводим ошибку
+    return;
+  }
+  Serial.print("Data:"); // Выводим 16 байт в формате HEX
+  for (uint8_t i = 0; i < 16; i++)
+  {
+    Serial.print("0x");
+    Serial.print(dataBlock[i], HEX);
+    Serial.print(", ");
+  }
+  Serial.println("");
+  uint8_t block6_macPart[6];
+  memcpy(block6_macPart, dataBlock, 6); // первые 6 байт блока №6
 
   String uidStr = "";
   for (uint8_t i = 0; i < rfid.uid.size; i++)
@@ -747,7 +783,7 @@ void loop()
     if (millis() - retries_timeout_temp >= RETRIES_TIMEOUT)
     {
       // Викликаємо утиліту, яка сформує payload і відправить (не інкрементує msgCounter)
-      if (!sendUidWithName(HUB_ID, msgId, rfid.uid.uidByte, rfid.uid.size))
+      if (!sendUidWithName(HUB_ID, msgId, rfid.uid.uidByte, rfid.uid.size, block6_macPart))
       {
         Serial.println("Помилка відправки повідомлення");
         break; // немає сенсу повторювати, payload некоректний
