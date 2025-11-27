@@ -12,6 +12,7 @@ bool notice_scan_card;
 bool notice_add_card;
 bool notice_edit_card;
 bool alert_check_uid_DB;
+bool alert;
 bool alert_surname_name;
 bool alert_find_uid_DB;
 
@@ -32,8 +33,11 @@ sets::Logger loggerSDcard(1000);
 #define RC522_SS_PIN 27
 #define RC522_RST_PIN 13
 MFRC522 rfid(RC522_SS_PIN, RC522_RST_PIN);
-MFRC522::MIFARE_Key key;    // об'єкт ключа
-MFRC522::StatusCode status; // об'єкт статусу
+MFRC522::MIFARE_Key keyDefault; // об'єкт стандартного ключа
+MFRC522::MIFARE_Key keyESP;     // об'єкт ключа
+MFRC522::StatusCode status;     // об'єкт статусу
+byte block = 7;
+byte macBytes[6];
 bool rfid_active = false;
 bool rfid_delete_confirm = false;
 String uidStr = "";
@@ -771,6 +775,11 @@ void update(sets::Updater &upd)
     notice_edit_card = false;
     upd.confirm("conf_edit"_h);
   }
+  if (alert)
+  {
+    alert = false;
+    upd.alert("ERROR!");
+  }
   if (alert_check_uid_DB)
   {
     alert_check_uid_DB = false;
@@ -875,6 +884,25 @@ void beep_tick(uint16_t freq) // Основна логіка писку з об�
   {
     beep_state = BEEP_IDLE;
   }
+}
+
+char *getChipID(uint8_t length = 12) // Дізнатись MAC ESP32
+{
+  static char idBuf[13]; // максимум 12 символов + '\0'
+
+  uint64_t mac = ESP.getEfuseMac();
+
+  // Печатаем полный MAC как 12 HEX символов
+  sprintf(idBuf, "%012llX", mac);
+
+  // Ограничиваем длину
+  if (length > 12)
+    length = 12;
+
+  // Отрезаем лишнее
+  idBuf[length] = '\0';
+
+  return idBuf;
 }
 
 void initFromDB() // Ініціалізація змінних з БД
@@ -1186,6 +1214,8 @@ void encoderB_tick()
     Serial.println("turn");
     back_to_home = true;
     show_on_Display(LINE_MENU, "", enc_button_state);
+    rfid_state = RFID_IDLE;
+    rfid_active = false;
   }
 }
 
@@ -1211,10 +1241,19 @@ void setup()
   rfid.PCD_AntennaOff();                    // Перезагружаем антенну
   delay(50);
   rfid.PCD_AntennaOn(); // Включаем антенну
+  uint64_t mac = ESP.getEfuseMac();
   for (byte i = 0; i < 6; i++)
-  {                        // Наполняем ключ
-    key.keyByte[i] = 0xFF; // Ключ по умолчанию 0xFFFFFFFFFFFF
+  {                               // Наполняем ключ
+    keyDefault.keyByte[i] = 0xFF; // Ключ по умолчанию 0xFFFFFFFFFFFF
+    keyESP.keyByte[i] = (mac >> (8 * (5 - i))) & 0xFF;
+    macBytes[i] = (mac >> (8 * (5 - i))) & 0xFF;
   }
+  for (int i = 0; i < 6; i++)
+  {
+    Serial.printf("%02X", macBytes[i]);
+  }
+  Serial.println();
+
   oled.println("RFID -> OK");
   delay(100);
 
@@ -1398,6 +1437,120 @@ void loop()
   {
     if (!rfid.PICC_IsNewCardPresent() || !rfid.PICC_ReadCardSerial())
       return;
+
+    /* Аутентификация сектора, указываем блок безопасности #7 и ключ A */
+    status = rfid.PCD_Authenticate(MFRC522::PICC_CMD_MF_AUTH_KEY_A, block, &keyDefault, &(rfid.uid));
+    if (status == MFRC522::STATUS_OK)
+    {
+      /* Запись блока, указываем блок безопасности #7 */
+      uint8_t secBlockDump[16];
+      // Ключ А
+      for (int i = 0; i < 6; i++)
+      {
+        secBlockDump[i] = macBytes[i];
+      }
+      // Access bits
+      secBlockDump[6] = 0x7F;
+      secBlockDump[7] = 0x07;
+      secBlockDump[8] = 0x88;
+      // User byte
+      secBlockDump[9] = 0xFF;
+      // Key B
+      for (int i = 0; i < 6; i++)
+      {
+        secBlockDump[10 + i] = macBytes[i];
+      }
+
+      status = rfid.MIFARE_Write(block, secBlockDump, 16); // Пишем массив в блок 7
+      if (status != MFRC522::STATUS_OK)
+      {                                       // Если не окэй
+        Serial.println("Смена ключа error!"); // Выводим ошибку
+        alert = true;
+        blink_state = LED_DENIED;
+        beep_state = BEEP_DENIED;
+        return;
+      }
+      Serial.println("Смена ключа УСПЕХ!");
+
+      /* Запись блока, указываем блок данных #6 */
+      uint8_t dataToWrite[16];
+      for (int i = 0; i < 6; i++)
+      {
+        dataToWrite[i] = macBytes[i];
+      }
+      dataToWrite[6] = 0xAB;
+      dataToWrite[7] = 0xCD;
+      for (int i = 8; i < 14; i++)
+      {
+        dataToWrite[i] = macBytes[i - 8];
+      }
+      dataToWrite[14] = 0xAB;
+      dataToWrite[15] = 0xCD;
+      status = rfid.MIFARE_Write(block - 1, dataToWrite, 16); // Пишем массив в блок -1
+      if (status != MFRC522::STATUS_OK)
+      {                                            // Если не окэй
+        Serial.println("Запись в блок №6 error!"); // Выводим ошибку
+        blink_state = LED_DENIED;
+        beep_state = BEEP_DENIED;
+      }
+      Serial.println("Запись в блок №6 УСПЕХ!");
+    }
+    else
+    {
+      Serial.println("Стандартний ключ не підходить!");
+      rfid.PICC_HaltA();
+      rfid.PCD_StopCrypto1();
+      delay(50);
+    }
+
+    if (!rfid.PICC_IsNewCardPresent() || !rfid.PICC_ReadCardSerial())
+    {
+      Serial.println("Не удалось перечитать карту после смены ключа");
+      return;
+    }
+
+    status = rfid.PCD_Authenticate(MFRC522::PICC_CMD_MF_AUTH_KEY_B, block, &keyESP, &(rfid.uid));
+    if (status != MFRC522::STATUS_OK)
+    {
+      Serial.println("Помилка авторизації"); // Выводим ошибку
+      return;
+    }
+    else
+    {
+      /* Чтение блока, указываем блок данных #block-1 */
+      uint8_t dataBlock[18];                                  // Буфер для чтения
+      uint8_t size = sizeof(dataBlock);                       // Размер буфера
+      status = rfid.MIFARE_Read(block - 1, dataBlock, &size); // Читаем 6 блок в буфер
+      if (status != MFRC522::STATUS_OK)
+      {                               // Если не окэй
+        Serial.println("Read error"); // Выводим ошибку
+        return;
+      }
+      Serial.print("Data:"); // Выводим 16 байт в формате HEX
+      for (uint8_t i = 0; i < 16; i++)
+      {
+        Serial.print("0x");
+        Serial.print(dataBlock[i], HEX);
+        Serial.print(", ");
+      }
+      Serial.println("");
+      /* --- Проверка первых 6 байт на совпадение с macBytes[] --- */
+      bool match = true;
+      for (int i = 0; i < 6; i++)
+      {
+        if (dataBlock[i] != macBytes[i])
+        {
+          match = false;
+          break;
+        }
+      }
+
+      if (!match)
+      {
+        Serial.println("ERROR: MAC наповнення блоку не підходить!");
+        return;
+      }
+    }
 
     uidStr = "";
     for (uint8_t i = 0; i < rfid.uid.size; i++)
