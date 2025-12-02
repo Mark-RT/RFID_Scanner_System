@@ -63,6 +63,18 @@ const unsigned long ACK_TIMEOUT = 800; // мілісекунд очікуван�
 const uint8_t MAX_RETRIES = 3;
 uint16_t RETRIES_TIMEOUT = 500; // час до наступної спроби
 
+#include <AESLib.h>
+AESLib aesLib;
+byte aes_key[16] = {
+    0x21, 0x33, 0x55, 0x77, 0x99, 0xAB, 0xCD, 0xEF,
+    0x10, 0x32, 0x54, 0x76, 0x98, 0xBA, 0xDC, 0xFE};
+// Основний IV
+byte aes_iv[16] = {
+    0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA,
+    0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA};
+byte iv_enc[16];
+byte iv_dec[16];
+
 #include <SD.h>
 #include <FS.h>
 #define SD_CS 14
@@ -230,6 +242,7 @@ void readFile(fs::FS &fs, const char *path, int linesPerChunk = 5)
     // Якщо зібрали linesPerChunk рядків — виводимо
     if (lineCount >= linesPerChunk)
     {
+      Serial.print(buffer);         // вивід на серійний монітор
       loggerSDcard.println(buffer); // вивід пачки
 
       // очищаємо для наступних рядків
@@ -241,6 +254,7 @@ void readFile(fs::FS &fs, const char *path, int linesPerChunk = 5)
   // Якщо файл закінчився, а в буфері щось є
   if (lineCount > 0)
   {
+    Serial.print(buffer);
     loggerSDcard.println(buffer);
   }
 
@@ -908,6 +922,13 @@ char *getChipID(uint8_t length = 12) // Дізнатись MAC ESP32
   return idBuf;
 }
 
+void clean_temp_DB_values()
+{
+  name_DB = "";
+  access_level_DB = 0;
+  date_time_DB = "";
+}
+
 void initFromDB() // Ініціалізація змінних з БД
 {
   HUB_ID = (uint8_t)db.get(kk::hub_id);
@@ -917,6 +938,32 @@ void initFromDB() // Ініціалізація змінних з БД
   led_G.blink(1, 200, 0);
   led_B.invert(1);
   led_B.blink(1, 200, 0);
+}
+
+uint16_t encryptBlock(const uint8_t *input, uint16_t inLen, uint8_t *output)
+{
+  memcpy(iv_enc, aes_iv, 16);
+
+  return aesLib.encrypt(
+      (byte *)input,
+      inLen,
+      (byte *)output,
+      aes_key,
+      sizeof(aes_key),
+      iv_enc);
+}
+
+uint16_t decryptBlock(const uint8_t *input, uint16_t inLen, uint8_t *output)
+{
+  memcpy(iv_dec, aes_iv, 16);
+
+  return aesLib.decrypt(
+      (byte *)input,
+      inLen,
+      (byte *)output,
+      aes_key,
+      sizeof(aes_key),
+      iv_dec);
 }
 
 uint8_t crc8(const uint8_t *data, size_t len) // ---- CRC8 ----
@@ -938,42 +985,49 @@ uint8_t crc8(const uint8_t *data, size_t len) // ---- CRC8 ----
 }
 
 // ===== buildAndSend для хаба (від хаба -> пристрій) =====
-bool buildAndSend(uint8_t to, uint16_t msgId, uint8_t type, const uint8_t *payload, uint8_t len)
+bool buildAndSend(uint8_t to, uint16_t msgId, uint8_t type,
+                  const uint8_t *payload, uint8_t len)
 {
-  if (len > MAX_TOTAL_PAYLOAD)
-    return 0;
+  uint8_t raw[256];
+  size_t r = 0;
 
-  uint8_t buf[256];
-  size_t idx = 0;
-  buf[idx++] = PREAMBLE;            // 0 – службовий байт, початок пакета
-  buf[idx++] = HUB_ID;              // 1 – src: ID відправника (цей хаб)
-  buf[idx++] = to;                  // 2 – dst: кому надсилаємо (DEVICE_ID)
-  buf[idx++] = (msgId >> 8) & 0xFF; // 3 – msgId (старший байт)
-  buf[idx++] = msgId & 0xFF;        // 4 – msgId (молодший байт)
-  buf[idx++] = type;                // 5 - тип пакета/запиту
-  buf[idx++] = len;                 // 6 - payload довжина
+  // --- УНІФІКОВАНА СТРУКТУРА ---
+  raw[r++] = 9;      // 0 access_level
+  raw[r++] = HUB_ID;                // 1 from (хаб)
+  raw[r++] = to;                    // 2 to
+  raw[r++] = (msgId >> 8) & 0xFF;   // 3 msgIdH
+  raw[r++] = msgId & 0xFF;          // 4 msgIdL
+  raw[r++] = type;                  // 5 TYPE_ACK / CMD_OPEN / etc.
+  raw[r++] = len;                   // 6 payload length
+
   if (len && payload)
   {
-    memcpy(&buf[idx], payload, len); // Копіюємо payload у пакет
-    idx += len;
+    memcpy(&raw[r], payload, len);
+    r += len;
   }
-  uint8_t crc = crc8(buf, idx); // CRC рахується по всіх попередніх байтах
-  buf[idx++] = crc;             // Додаємо CRC у кінець пакета
+
+  // --- ШИФРУЄМО ---
+  uint8_t encrypted[256];
+  uint16_t encLen = encryptBlock(raw, r, encrypted);
+
+  // --- ПАКЕТ ---
+  uint8_t buf[256];
+  size_t idx = 0;
+
+  buf[idx++] = PREAMBLE;
+  memcpy(&buf[idx], encrypted, encLen);
+  idx += encLen;
+
+  uint8_t crc = crc8(&buf[1], encLen);
+  buf[idx++] = crc;
 
   LoRa.beginPacket();
   LoRa.write(buf, idx);
   LoRa.endPacket();
-
   LoRa.receive();
-  return 1;
+  return true;
 }
 
-void clean_temp_DB_values()
-{
-  name_DB = "";
-  access_level_DB = 0;
-  date_time_DB = "";
-}
 // ===== Функція прийому і парсингу одного пакета =====
 void handleIncomingPacket()
 {
@@ -995,100 +1049,119 @@ void handleIncomingPacket()
     return;                        // Якщо менше 8 байт або неправильна преамбула — вихід
 
   // Перевірка CRC пакета:
-  uint8_t recv_crc = buf[i - 1];    // Останній байт пакета — CRC
-  if (crc8(buf, i - 1) != recv_crc) // Перевіряємо CRC всіх попередніх байтів
+  uint8_t recv_crc = buf[i - 1];
+  if (crc8(&buf[1], i - 2) != recv_crc)
   {
-    Serial.println("CRC не співпадає, відміна"); // Лог про помилку CRC
-    return;                                      // Пакет пошкоджений, вихід
+    Serial.println("CRC не співпадає");
+    return;
   }
 
-  uint8_t accessLevel = buf[1];                                // Рівень доступу пристрою-відправника
-  uint8_t device = buf[2];                                     // ID пристрою-відправника
-  uint8_t hub = buf[3];                                        // ID хаба-отримувача
-  uint16_t msgId = (uint16_t(buf[4]) << 8) | uint16_t(buf[5]); // msgId (2 байти)
-  uint8_t type = buf[6];                                       // Тип пакета (TYPE_REQ, TYPE_ACK тощо)
-  uint8_t len = buf[7];                                        // Довжина payload
+  // ==== AES ДЕШИФРУВАННЯ ====
+  uint8_t decrypted[256];
+  uint16_t decLen = decryptBlock(&buf[1], i - 2, decrypted);
+  if (decLen < 7) // мінімально достатньо для службових полів
+  {
+    Serial.println("Помилка дешифрування");
+    return;
+  }
+
+  uint8_t accessLevel = decrypted[0];
+  uint8_t device = decrypted[1];
+  uint8_t hub = decrypted[2];
+
+  uint16_t msgId = (uint16_t(decrypted[3]) << 8) | decrypted[4];
+  uint8_t type = decrypted[5];
+  uint8_t len = decrypted[6];
 
   // Перевіряємо, що пакет призначений хабу (HUB_ID) або broadcast (0)
   if (hub != HUB_ID && hub != 0)
     return; // Пакет не для цього хаба — ігноруємо
 
   // Захист від некоректного len
-  if ((int)len > i - 8) // len більше, ніж доступно байт для payload
-    return;             // Некоректний пакет, вихід
-
-  if (type == TYPE_REQ) // Якщо пакет — запит від сканера
+  if (len > decLen - 7)
   {
-    // Розбираємо payload: [name_len][name_bytes][uid_len][uid_bytes]
-    uint8_t name_len = buf[8]; // Перший байт payload — довжина імені
+    Serial.println("Некоректна довжина payload");
+    return;
+  }
 
-    if (len < 2 || ((size_t)name_len > len - 2)) // Мінімум name_len + 1 byte для uid_len
-    {
-      Serial.println("REQ payload короткий або пошкоджене ім'я, відміна");
-      buildAndSend(device, msgId, CMD_DENY, NULL, 0); // Відправляємо відмову
-      return;                                         // Вихід, пакет не валідний
-    }
+  uint8_t *payload = &decrypted[7];
+  
+  if (type == TYPE_REQ)
+  {
+    // ---- Payload: [name_len][name][uid_len][uid][6 MAC bytes] ----
 
-    String deviceName = ""; // Ініціалізуємо ім'я як пусте
-    if (name_len > 0)       // Якщо ім'я є
+    uint8_t name_len = payload[0];
+    if (name_len > len - 2)
     {
-      char tmp[129];                                            // Тимчасовий буфер для імені
-      size_t copy_len = min((size_t)name_len, sizeof(tmp) - 1); // Копіюємо тільки скільки влазить
-      memcpy(tmp, &buf[9], copy_len);                           // Копіюємо байти імені з пакета
-      tmp[copy_len] = '\0';                                     // Додаємо нуль-термінатор
-      deviceName = String(tmp);                                 // Створюємо String з буфера
-    }
-
-    size_t uid_len_index = 9 + name_len; // Індекс байта, де починається uid_len
-    if (uid_len_index >= (size_t)i)      // Перевірка виходу за межі буфера
-    {
-      Serial.println("Payload truncated before uid_len");
-      buildAndSend(device, msgId, CMD_DENY, NULL, 0); // Відправка відмови
-      return;                                         // Вихід
-    }
-
-    uint8_t uid_len = buf[uid_len_index];      // Довжина UID
-    if (uid_len == 0 || uid_len > MAX_UID_LEN) // Перевірка коректності UID
-    {
-      Serial.println("Bad uid_len");
+      Serial.println("Помилка: name_len виходить за межі payload");
       buildAndSend(device, msgId, CMD_DENY, NULL, 0);
       return;
     }
 
-    size_t uid_start = uid_len_index + 1; // Індекс початку UID
-    if ((int)uid_start + uid_len > i - 1) // Перевірка, щоб UID не виходив за межі (i-1 через CRC)
+    // ---- Імʼя пристрою ----
+    String deviceName = "";
+    if (name_len > 0)
     {
-      Serial.println("UID bytes out of range");
+      char tmp[129];
+      size_t cpy = min((size_t)name_len, sizeof(tmp) - 1);
+      memcpy(tmp, &payload[1], cpy);
+      tmp[cpy] = '\0';
+      deviceName = String(tmp);
+    }
+
+    // ---- UID ----
+    uint8_t uid_len = payload[1 + name_len];
+    if (uid_len == 0 || uid_len > MAX_UID_LEN)
+    {
+      Serial.println("Помилка uid_len");
       buildAndSend(device, msgId, CMD_DENY, NULL, 0);
       return;
     }
 
-    // Копіюємо UID у тимчасовий буфер
-    uint8_t uid_buf[MAX_UID_LEN];
-    memcpy(uid_buf, &buf[uid_start], uid_len);
+    uint8_t *uid_ptr = &payload[2 + name_len];
 
-    // === ПЕРЕВІРКА 6 MAC-БАЙТ ІЗ КАРТКИ ===
-
-    // Обчислюємо індекс початку цих 6 байтів
-    size_t mac_start = uid_start + uid_len;
-
-    // Перевіряємо, що в payload є місце для 6 байт
-    if (mac_start + 6 > (size_t)(8 + len)) // 8 — заг. заголовок LoRa пакета
+    if (2 + name_len + uid_len > len)
     {
-      Serial.println("MAC bytes missing in payload");
+      Serial.println("UID виходить за межі payload");
       buildAndSend(device, msgId, CMD_DENY, NULL, 0);
       return;
     }
 
-    // Читаємо 6 байт
-    uint8_t cardMac[6];
-    memcpy(cardMac, &buf[mac_start], 6);
+    // ---- 6 MAC байтів ----
+    uint8_t *mac_ptr = &payload[2 + name_len + uid_len];
 
-    // Порівнюємо з macBytes[]
+    if (2 + name_len + uid_len + 6 > len)
+    {
+      Serial.println("MAC байти виходять за payload");
+      buildAndSend(device, msgId, CMD_DENY, NULL, 0);
+      return;
+    }
+
+    // ---- Збір UID в HEX ----
+    String uidDeviceStr = "";
+    for (uint8_t k = 0; k < uid_len; ++k)
+    {
+      if (uid_ptr[k] < 0x10) uidDeviceStr += "0";
+      uidDeviceStr += String(uid_ptr[k], HEX);
+    }
+    uidDeviceStr.toUpperCase();
+
+    Serial.print("REQ від пристрою ");
+    Serial.print(device);
+    Serial.print(", msgId=");
+    Serial.print(msgId);
+    Serial.print(", Name='");
+    Serial.print(deviceName);
+    Serial.print("', UID=");
+    Serial.println(uidDeviceStr);
+
+    show_on_Display(LINE_UID, uidDeviceStr);
+
+    // ===== Перевірка MAC пристрою =====
     bool mac_ok = true;
     for (uint8_t j = 0; j < 6; j++)
     {
-      if (cardMac[j] != macBytes[j])
+      if (mac_ptr[j] != macBytes[j])
       {
         mac_ok = false;
         break;
@@ -1097,52 +1170,17 @@ void handleIncomingPacket()
 
     if (!mac_ok)
     {
-      Serial.println("MAC не співпадає! Відмова.");
-      Serial.print("MAC картки: ");
-      for (int j = 0; j < 6; j++)
-      {
-        Serial.print(cardMac[j], HEX);
-        Serial.print(" ");
-      }
-      Serial.println();
-
-      Serial.print("MAC ESP:    ");
-      for (int j = 0; j < 6; j++)
-      {
-        Serial.print(macBytes[j], HEX);
-        Serial.print(" ");
-      }
-      Serial.println();
-
+      Serial.println("MAC не співпадає — ВІДМОВА");
       buildAndSend(device, msgId, CMD_DENY, NULL, 0);
       return;
     }
 
-    Serial.println("MAC збігається — ок");
+    Serial.println("MAC збігається — OK");
 
-    // Логування
-    Serial.print("REQ від: ");
-    Serial.print(device);
-    Serial.print("  msgId: ");
-    Serial.print(msgId);
-    Serial.print("  Назва: '");
-    Serial.print(deviceName);
-    Serial.print("'  UID картки: ");
-
-    String uidDeviceStr = "";
-    for (uint8_t k = 0; k < uid_len; ++k) // Формуємо рядок для логу
+    // ===== Перевірка користувача в БД =====
+    if (findUser(uidDeviceStr, name_DB, access_level_DB, date_time_DB))
     {
-      if (uid_buf[k] < 0x10)
-        uidDeviceStr += "0"; // Додаємо провідний нуль для однобайтових значень
-      uidDeviceStr += String(uid_buf[k], HEX);
-    }
-    uidDeviceStr.toUpperCase(); // Приводимо до великих літер
-    Serial.println(uidDeviceStr);
-    show_on_Display(LINE_UID, uidDeviceStr);
-
-    if (findUser(uidDeviceStr, name_DB, access_level_DB, date_time_DB)) // Перевірка наявності UID в БД
-    {
-      Serial.println("Прийнятий UID є в БД");
+      Serial.println("UID знайдено в БД");
 
       if (access_level_DB >= accessLevel)
       {
@@ -1151,24 +1189,24 @@ void handleIncomingPacket()
       }
       else
       {
-        Serial.println("Рівень доступу не ваш, відмова!");
+        Serial.println("Недостатній рівень доступу");
         logger.println(sets::Logger::error() + "UID: " + uidDeviceStr + " відмова по рівню");
         buildAndSend(device, msgId, CMD_DENY, NULL, 0);
-        return;
       }
     }
     else
     {
-      Serial.println("Прийнятий UID відсутній в БД, відмова!");
-      logger.println(sets::Logger::error() + "UID: " + uidDeviceStr + " відмова, не знайдено");
+      Serial.println("UID немає в БД — відмова");
+      logger.println(sets::Logger::error() + "UID: " + uidDeviceStr + " не знайдено");
       buildAndSend(device, msgId, CMD_DENY, NULL, 0);
-      return;
     }
+
     clean_temp_DB_values();
   }
-  else // Якщо type відмінний від TYPE_REQ
+
+  else
   {
-    Serial.print("Невідомий type "); // Логування
+    Serial.print("Невідомий тип пакета: ");
     Serial.println(type);
   }
 }
@@ -1293,14 +1331,17 @@ void setup()
 
   //============= RFID ===============
   rfid.PCD_Init();
-  rfid.PCD_SetAntennaGain(rfid.RxGain_max); // Установка усиления антенны
-  rfid.PCD_AntennaOff();                    // Перезагружаем антенну
+  rfid.PCD_SetAntennaGain(rfid.RxGain_max); // Установка підсилення антени
+  rfid.PCD_AntennaOff();                    // Перезавантаження антени
   delay(50);
-  rfid.PCD_AntennaOn(); // Включаем антенну
+  rfid.PCD_AntennaOn(); // Вмикаємо антену
+  Serial.println("RFID ініціалізовано");
+  oled.println("RFID -> OK");
+
   uint64_t mac = ESP.getEfuseMac();
-  for (byte i = 0; i < 6; i++)
-  {                               // Наполняем ключ
-    keyDefault.keyByte[i] = 0xFF; // Ключ по умолчанию 0xFFFFFFFFFFFF
+  for (byte i = 0; i < 6; i++) // Наповнюємо ключі
+  {
+    keyDefault.keyByte[i] = 0xFF; // Ключ по дефолту 0xFFFFFFFFFFFF
     keyESP.keyByte[i] = (mac >> (8 * (5 - i))) & 0xFF;
     macBytes[i] = (mac >> (8 * (5 - i))) & 0xFF;
   }
@@ -1309,8 +1350,6 @@ void setup()
     Serial.printf("%02X", macBytes[i]);
   }
   Serial.println();
-
-  oled.println("RFID -> OK");
   delay(100);
 
   //============= LoRa ===============
@@ -1378,6 +1417,7 @@ void setup()
   }
   file.close();
   listDir(SD, "/", 0);
+  readFile(SD, DB_FILE_NAME);
   delay(100);
 
   // ======== WIFI ========
@@ -1494,6 +1534,7 @@ void loop()
     if (!rfid.PICC_IsNewCardPresent() || !rfid.PICC_ReadCardSerial())
       return;
 
+    Serial.println("RFID ініціалізовано");
     /* Аутентификация сектора, указываем блок безопасности #7 и ключ A */
     status = rfid.PCD_Authenticate(MFRC522::PICC_CMD_MF_AUTH_KEY_A, block, &keyDefault, &(rfid.uid));
     if (status == MFRC522::STATUS_OK)

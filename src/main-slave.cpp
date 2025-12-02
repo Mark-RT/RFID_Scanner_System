@@ -1,5 +1,7 @@
 #include <SPI.h>
 
+#define BUTTON_PIN 39 // кнопка для налаштувань
+
 #include <GyverDBFile.h>
 #include <LittleFS.h>
 GyverDBFile db(&LittleFS, "/data.db");
@@ -53,6 +55,18 @@ byte block = 7;
 const uint16_t ACK_TIMEOUT = 800;     // мілісекунд очікування підтвердження відповіді від хаба
 const uint8_t MAX_RETRIES = 3;        // макс. кількість спроб відправки повідомлення
 const uint16_t RETRIES_TIMEOUT = 300; // час до наступної спроби
+
+#include <AESLib.h>
+AESLib aesLib;
+byte aes_key[16] = {
+    0x21, 0x33, 0x55, 0x77, 0x99, 0xAB, 0xCD, 0xEF,
+    0x10, 0x32, 0x54, 0x76, 0x98, 0xBA, 0xDC, 0xFE};
+// Основний IV
+byte aes_iv[16] = {
+    0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA,
+    0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA};
+byte iv_enc[16];
+byte iv_dec[16];
 
 #include <Blinker.h>
 #define LED_R_PIN 25
@@ -422,6 +436,32 @@ void initFromDB() // Ініціалізація змінних з БД
   utf8_truncate_by_chars(tmp, deviceNameBuf, MAX_NAME_CHARS, sizeof(deviceNameBuf));
 }
 
+uint16_t encryptBlock(const uint8_t *input, uint16_t inLen, uint8_t *output)
+{
+  memcpy(iv_enc, aes_iv, 16);
+
+  return aesLib.encrypt(
+      (byte *)input,
+      inLen,
+      (byte *)output,
+      aes_key,
+      sizeof(aes_key),
+      iv_enc);
+}
+
+uint16_t decryptBlock(const uint8_t *input, uint16_t inLen, uint8_t *output)
+{
+  memcpy(iv_dec, aes_iv, 16);
+
+  return aesLib.decrypt(
+      (byte *)input,
+      inLen,
+      (byte *)output,
+      aes_key,
+      sizeof(aes_key),
+      iv_dec);
+}
+
 // ---- CRC8 ----
 uint8_t crc8(const uint8_t *data, size_t len)
 {
@@ -445,115 +485,107 @@ uint8_t crc8(const uint8_t *data, size_t len)
 bool buildAndSend(uint8_t to, uint16_t msgId, uint8_t type, const uint8_t *payload, uint8_t len)
 {
   if (len > MAX_TOTAL_PAYLOAD)
-    return 1; // payload занадто великий
+    return 1;
 
+  uint8_t raw[256]; // тут формуємо НЕЗАШИФРОВАНІ службові байти
+  size_t r = 0;
+
+  raw[r++] = DEVICE_ACCESS_LEVEL;
+  raw[r++] = DEVICE_ID;
+  raw[r++] = to;
+  raw[r++] = (msgId >> 8) & 0xFF;
+  raw[r++] = msgId & 0xFF;
+  raw[r++] = type;
+  raw[r++] = len;
+
+  memcpy(&raw[r], payload, len);
+  r += len;
+
+  // === AES128 CBC ===
+  uint8_t encrypted[256];
+  uint16_t encLen = encryptBlock(raw, r, encrypted);
+
+  // === Формування фінального LoRa пакета ===
   uint8_t buf[256];
   size_t idx = 0;
-  buf[idx++] = PREAMBLE;            // 0 – службовий байт, початок пакета
-  buf[idx++] = DEVICE_ACCESS_LEVEL; // 1 – access_level відправника
-  buf[idx++] = DEVICE_ID;           // 2 – src: ID відправника (цей пристрій)
-  buf[idx++] = to;                  // 3 – dst: кому надсилаємо (HUB_ID)
-  buf[idx++] = (msgId >> 8) & 0xFF; // 4 – msgId (старший байт)
-  buf[idx++] = msgId & 0xFF;        // 5 – msgId (молодший байт)
-  buf[idx++] = type;                // 6 - тип пакета/запиту
-  buf[idx++] = len;                 // 7 - payload довжина
-  if (len && payload)
-  {
-    memcpy(&buf[idx], payload, len); // Копіюємо payload у пакет
-    idx += len;
-  }
-  uint8_t crc = crc8(buf, idx); // CRC рахується по всіх попередніх байтах
-  buf[idx++] = crc;             // Додаємо CRC у кінець пакета
 
-  // --- DEBUG: вивід сформованого пакета по байтах для відладки ---
-  Serial.println("Packet dump (index : 0xHEX):");
-  for (size_t _i = 0; _i < idx; ++_i)
+  buf[idx++] = PREAMBLE; // НЕ шифрується
+
+  memcpy(&buf[idx], encrypted, encLen);
+  idx += encLen;
+
+  // === CRC по ЗАШИФРОВАНИХ байтах ===
+  uint8_t crc = crc8(&buf[1], encLen); // CRC рахуємо ТІЛЬКИ по тому, що під шифром
+  buf[idx++] = crc;
+
+  // === DEBUG ===
+  Serial.println("Encrypted packet:");
+  for (size_t i = 0; i < idx; i++)
   {
-    Serial.print(_i);
-    Serial.print(" : 0x");
-    if (buf[_i] < 0x10)
-      Serial.print('0');
-    Serial.print(buf[_i], HEX);
-    Serial.println();
+    Serial.printf("%02X ", buf[i]);
   }
-  Serial.println("--- end packet ---");
-  // --- end debug ---
+  Serial.println();
 
   LoRa.beginPacket();
   LoRa.write(buf, idx);
   LoRa.endPacket();
+
   return 0;
 }
 
 // ---- waitForResponse: читати packetSize, мінімум 8 байт ----
-// додаємо max size для outPayload
 bool waitForResponse(uint16_t expectedMsgId, unsigned long timeout,
                      uint8_t *outType, uint8_t *outPayload, uint8_t *outLen,
                      size_t outPayloadMaxLen)
 {
-  unsigned long t0 = millis(); // Фіксуємо час старту очікування
+  unsigned long t0 = millis();
 
-  while (millis() - t0 < timeout) // Крутимо цикл, доки не минув timeout
+  while (millis() - t0 < timeout)
   {
-    int packetSize = LoRa.parsePacket(); // Перевіряємо, чи прийшов пакет LoRa
-                                         // Повертає >0 якщо пакет доступний
+    int packetSize = LoRa.parsePacket();
+    if (packetSize <= 0)
+      continue;
 
-    if (packetSize > 0) // Якщо пакет дійсно є
-    {
-      uint8_t buf[256]; // Буфер для зчитування всього прийнятого пакету
-      int i = 0;        // Лічильник фактично прочитаних байтів
+    uint8_t buf[256];
+    int i = 0;
+    while (LoRa.available() && i < packetSize)
+      buf[i++] = LoRa.read();
 
-      while (i < packetSize &&     // Читаємо тільки заявлений розмір пакета
-             LoRa.available() &&   // Поки є байти в LoRa буфері
-             i < (int)sizeof(buf)) // І поки не переповнюємо наш локальний буфер
-        buf[i++] = LoRa.read();    // Зчитуємо байт у buf[i] і збільшуємо i
+    if (i < 5)
+      continue;
+    if (buf[0] != PREAMBLE)
+      continue;
 
-      if (i < 8)  // Пакет менше мінімально дозволених 8 байт?
-        continue; // Пропускаємо його (це сміття)
+    uint8_t recv_crc = buf[i - 1];
+    if (crc8(&buf[1], i - 2) != recv_crc)
+      continue;
 
-      if (buf[0] != PREAMBLE) // Перевірка першого байта — стартовий маркер пакета
-        continue;             // Якщо не співпадає — не наш пакет
+    // ==== Дешифруємо ====
+    uint8_t decrypted[256];
+    uint16_t decLen = decryptBlock(&buf[1], i - 2, decrypted);
 
-      uint8_t recv_crc = buf[i - 1];    // Останній байт отриманого пакета — CRC
-      if (crc8(buf, i - 1) != recv_crc) // Обчислюємо CRC від усіх попередніх байтів
-        continue;                       // CRC не співпав — пакет зіпсований, ігноруємо
+    // ==== Аналізуємо за протоколом ====
+    uint8_t access = decrypted[0];
+    uint8_t from = decrypted[1];
+    uint8_t to = decrypted[2];
+    uint16_t msgId = (decrypted[3] << 8) | decrypted[4];
+    uint8_t type = decrypted[5];
+    uint8_t len = decrypted[6];
 
-      uint8_t from = buf[1];                                       // Адреса відправника пакета
-      uint8_t to = buf[2];                                         // Адреса отримувача (має бути цього пристрою)
-      uint16_t msgId = (uint16_t(buf[3]) << 8) | uint16_t(buf[4]); // Старший байт msgId Молодший байт msgId (двобайтове число)
-      uint8_t type = buf[5];                                       // Тип повідомлення (команда/відповідь)
-      uint8_t len = buf[6];                                        // Довжина payload у байтах
+    if (msgId != expectedMsgId)
+      continue;
 
-      // Перевірка, чи пакет адресований нам або broadcast (0)
-      if (to != DEVICE_ID && to != 0)
-        continue; // Не нам — пропускаємо
+    if (outType)
+      *outType = type;
+    if (outLen)
+      *outLen = len;
 
-      if (msgId != expectedMsgId) // Перевіряємо чи це відповідь на наше запитання
-        continue;                 // MsgId не співпав — не наша відповідь
+    memcpy(outPayload, &decrypted[7], len);
 
-      // Перевірка коректності поля len
-      if ((int)len > i - 8) // len не може бути більшим, ніж реальний залишок пакета
-        continue;           // Якщо більший — пакет некоректний
-
-      if (outType)       // Якщо вказівник не NULL
-        *outType = type; // Записуємо тип пакета у змінну користувача
-
-      if (outLen)      // Якщо користувач хоче отримати довжину payload
-        *outLen = len; // Записуємо її
-
-      if (outPayload && len) // Якщо є куди копіювати payload
-      {
-        if ((size_t)len > outPayloadMaxLen) // Якщо payload більший, ніж дозволена довжина буфера
-          continue;                         // Ігноруємо цей пакет (не влазить)
-
-        memcpy(outPayload, &buf[7], len); // Копіюємо payload, який починається з buf[7]
-      }
-
-      return true; // Пакет валідний, правильний, і відправлений нам.
-    }
+    return true;
   }
 
-  return false; // Час вийшов, відповідь не отримано
+  return false;
 }
 
 // Оновлений sendUidWithName: НЕ інкрементує msgCounter; приймає msgId як параметр
@@ -596,6 +628,7 @@ void setup()
 {
   Serial.begin(115200);
   SPI.begin();
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
 
   // ======== BEEP ========
   beep.init(BUZZER_PIN, PWM_CHANNEL, PWM_RESOLUTION);
@@ -663,51 +696,54 @@ void setup()
   db.init(kk::wifi_pass, "");
 
   // ======== WIFI ========
-  setStampZone(2); // годинний пояс
-
-  if (db[kk::wifi_ssid].length())
+  if (!digitalRead(BUTTON_PIN))
   {
-    WiFi.begin(db[kk::wifi_ssid], db[kk::wifi_pass]);
-    Serial.print("Connect to " + db[kk::wifi_ssid]);
-    int tries = 15;
-    while (WiFi.status() != WL_CONNECTED)
-    {
-      delay(500);
-      Serial.print('.');
-      if (!--tries)
-        break;
-    }
-    Serial.println(WiFi.localIP());
-  }
+    setStampZone(2); // годинний пояс
 
-  if (db[kk::wifi_ap_ssid].length())
-  {
-    int triess = 15;
-    bool apCreated = false;
-
-    while (triess--)
+    if (db[kk::wifi_ssid].length())
     {
-      Serial.print("Створюю AP ");
-      if (WiFi.softAP(db[kk::wifi_ap_ssid], db[kk::wifi_ap_pass]))
+      WiFi.begin(db[kk::wifi_ssid], db[kk::wifi_pass]);
+      Serial.print("Connect to " + db[kk::wifi_ssid]);
+      int tries = 15;
+      while (WiFi.status() != WL_CONNECTED)
       {
-        apCreated = true;
-        break;
+        delay(500);
+        Serial.print('.');
+        if (!--tries)
+          break;
       }
-      delay(500);
-      Serial.print('.');
+      Serial.println(WiFi.localIP());
     }
 
-    if (apCreated)
+    if (db[kk::wifi_ap_ssid].length())
     {
-      Serial.print("успішно: ");
-      Serial.println(WiFi.softAPIP());
-    }
-    else
-    {
-      Serial.println("Не вдалося створити AP, створюємо запасний...");
-      WiFi.softAP("RFID_rezerv", "12345678");
-      Serial.print("AP: ");
-      Serial.println(WiFi.softAPIP());
+      int triess = 15;
+      bool apCreated = false;
+
+      while (triess--)
+      {
+        Serial.print("Створюю AP ");
+        if (WiFi.softAP(db[kk::wifi_ap_ssid], db[kk::wifi_ap_pass]))
+        {
+          apCreated = true;
+          break;
+        }
+        delay(500);
+        Serial.print('.');
+      }
+
+      if (apCreated)
+      {
+        Serial.print("успішно: ");
+        Serial.println(WiFi.softAPIP());
+      }
+      else
+      {
+        Serial.println("Не вдалося створити AP, створюємо запасний...");
+        WiFi.softAP("RFID_rezerv", "12345678");
+        Serial.print("AP: ");
+        Serial.println(WiFi.softAPIP());
+      }
     }
   }
   initFromDB();
