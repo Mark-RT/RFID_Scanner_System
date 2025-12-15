@@ -696,56 +696,56 @@ void setup()
   db.init(kk::wifi_pass, "");
 
   // ======== WIFI ========
-  if (!digitalRead(BUTTON_PIN))
-  {
-    setStampZone(2); // годинний пояс
+  // if (!digitalRead(BUTTON_PIN))
+  //{
+  setStampZone(2); // годинний пояс
 
-    if (db[kk::wifi_ssid].length())
+  if (db[kk::wifi_ssid].length())
+  {
+    WiFi.begin(db[kk::wifi_ssid], db[kk::wifi_pass]);
+    Serial.print("Connect to " + db[kk::wifi_ssid]);
+    int tries = 15;
+    while (WiFi.status() != WL_CONNECTED)
     {
-      WiFi.begin(db[kk::wifi_ssid], db[kk::wifi_pass]);
-      Serial.print("Connect to " + db[kk::wifi_ssid]);
-      int tries = 15;
-      while (WiFi.status() != WL_CONNECTED)
+      delay(500);
+      Serial.print('.');
+      if (!--tries)
+        break;
+    }
+    Serial.println(WiFi.localIP());
+  }
+
+  if (db[kk::wifi_ap_ssid].length())
+  {
+    int triess = 15;
+    bool apCreated = false;
+
+    while (triess--)
+    {
+      Serial.print("Створюю AP ");
+      if (WiFi.softAP(db[kk::wifi_ap_ssid], db[kk::wifi_ap_pass]))
       {
-        delay(500);
-        Serial.print('.');
-        if (!--tries)
-          break;
+        apCreated = true;
+        break;
       }
-      Serial.println(WiFi.localIP());
+      delay(500);
+      Serial.print('.');
     }
 
-    if (db[kk::wifi_ap_ssid].length())
+    if (apCreated)
     {
-      int triess = 15;
-      bool apCreated = false;
-
-      while (triess--)
-      {
-        Serial.print("Створюю AP ");
-        if (WiFi.softAP(db[kk::wifi_ap_ssid], db[kk::wifi_ap_pass]))
-        {
-          apCreated = true;
-          break;
-        }
-        delay(500);
-        Serial.print('.');
-      }
-
-      if (apCreated)
-      {
-        Serial.print("успішно: ");
-        Serial.println(WiFi.softAPIP());
-      }
-      else
-      {
-        Serial.println("Не вдалося створити AP, створюємо запасний...");
-        WiFi.softAP("RFID_rezerv", "12345678");
-        Serial.print("AP: ");
-        Serial.println(WiFi.softAPIP());
-      }
+      Serial.print("успішно: ");
+      Serial.println(WiFi.softAPIP());
+    }
+    else
+    {
+      Serial.println("Не вдалося створити AP, створюємо запасний...");
+      WiFi.softAP("RFID_rezerv", "12345678");
+      Serial.print("AP: ");
+      Serial.println(WiFi.softAPIP());
     }
   }
+  //}
   initFromDB();
 }
 

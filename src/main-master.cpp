@@ -1506,6 +1506,7 @@ void setup()
       oled.println(WiFi.softAPIP());
     }
   }
+  back_to_main_menu(1);
   initFromDB();
 }
 
